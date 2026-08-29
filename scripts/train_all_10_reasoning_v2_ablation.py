@@ -55,6 +55,7 @@ import gc
 import hashlib
 import json
 import math
+import pickle
 import random
 import shutil
 import sys
@@ -260,6 +261,42 @@ def resolve_dtype(name: str) -> torch.dtype:
 # SOURCE ROWS + Reasoning_VLM_v2 EGO CONTEXT RESTORATION
 # =============================================================================
 
+
+# ---------------------------------------------------------------------------
+# nuReasoning pickle compatibility
+# ---------------------------------------------------------------------------
+# Some ego_state.pkl files were serialized with classes whose module path is
+# "data_schema" or "data_schema_v0". The original module is not required here:
+# Action Expert only needs the stored object attributes. Intercept those legacy
+# class lookups during unpickling and map them to permissive placeholder classes.
+
+_LEGACY_PICKLE_CLASS_CACHE: Dict[Tuple[str, str], type] = {}
+
+
+def _legacy_pickle_class(module: str, name: str) -> type:
+    key = (str(module), str(name))
+
+    if key not in _LEGACY_PICKLE_CLASS_CACHE:
+        cls = type(str(name), (), {})
+        cls.__module__ = str(module)
+        _LEGACY_PICKLE_CLASS_CACHE[key] = cls
+
+    return _LEGACY_PICKLE_CLASS_CACHE[key]
+
+
+class NuReasoningCompatUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if module in {"data_schema", "data_schema_v0"}:
+            return _legacy_pickle_class(module, name)
+
+        return super().find_class(module, name)
+
+
+def load_nureasoning_pickle(path: Path) -> Any:
+    with Path(path).open("rb") as f:
+        return NuReasoningCompatUnpickler(f).load()
+
+
 _RAW_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -339,7 +376,7 @@ def restore_v2_ego_context(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     row = dict(row)
     ego_path = _resolve_raw_ego_path(row)
-    ego_state = vlm_v2_core.load_pickle(ego_path)
+    ego_state = load_nureasoning_pickle(ego_path)
 
     _, _, heading = vlm_v2_core.extract_pose(ego_state)
     speed = vlm_v2_core.extract_speed_mps(ego_state)
@@ -2110,9 +2147,6 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
 
     set_seed(args.seed)
-
-    # reasoning_v2_core uses the nuReasoning data_schema when unpickling ego_state.
-    vlm_v2_core.install_pickle_aliases
 
     train_rows = load_split(args.train_jsonl)
     val_rows = load_split(args.val_jsonl)
