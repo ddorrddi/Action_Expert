@@ -46,6 +46,7 @@ Important
 - Action Expert architecture/capacity/loss/optimizer/training schedule are kept.
 - One VLM KV cache is generated once; then the VLM is unloaded.
 - The 10 Action Experts are trained sequentially, one model at a time.
+- Training order: Flow/DiT v2 (direct -> reasoning) first, then Transformer ablations.
 """
 
 from __future__ import annotations
@@ -117,7 +118,7 @@ from action_model_ablation_v2 import (
     trajectory_metrics_np as direct_metrics_np,
 )
 
-from action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     count_trainable_parameters as count_flow_params,
@@ -208,6 +209,13 @@ def cleanup_cuda() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -1065,6 +1073,8 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
         out_dir.mkdir(parents=True, exist_ok=True)
         manifest = []
 
+        split_start = time.perf_counter()
+
         for index, row in enumerate(rows, 1):
             t0 = time.perf_counter()
             sid = row["id"]
@@ -1097,14 +1107,22 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
                 ),
             })
 
+            sample_sec = time.perf_counter() - t0
+            split_elapsed = time.perf_counter() - split_start
+            avg_sec = split_elapsed / index
+            split_eta = avg_sec * (len(rows) - index)
+
             print(
-                f"[cache {split} {index:04d}/{len(rows):04d}] "
-                f"id={sid} "
+                f"[CACHE {split.upper():5s}] "
+                f"{index:04d}/{len(rows):04d} | "
+                f"id={sid} | "
                 f"directT={record['direct_kv'].shape[0]} "
                 f"reasonT={record['reasoning_delta_kv'].shape[0]} "
-                f"D={record['direct_kv'].shape[-1]} "
-                f"prefix_diff={record['prefix_max_abs_diff']:.3e} "
-                f"{time.perf_counter()-t0:.2f}s",
+                f"D={record['direct_kv'].shape[-1]} | "
+                f"sample={sample_sec:.2f}s | "
+                f"avg={avg_sec:.2f}s/sample | "
+                f"elapsed={format_eta(split_elapsed)} | "
+                f"eta={format_eta(split_eta)}",
                 flush=True,
             )
 
@@ -1428,6 +1446,7 @@ def train_direct(
     best_epoch = 0
     no_improve = 0
     global_step = 0
+    model_start = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -1481,7 +1500,11 @@ def train_direct(
         train_loss_value = train_loss_sum / train_n
         val = eval_direct(model, val_dl, device)
 
-        elapsed_min = (time.perf_counter() - t0) / 60.0
+        epoch_sec = time.perf_counter() - t0
+        elapsed_min = epoch_sec / 60.0
+        model_elapsed = time.perf_counter() - model_start
+        avg_epoch_sec = model_elapsed / epoch
+        model_eta = avg_epoch_sec * (args.epochs - epoch)
         peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
         row = {
@@ -1501,14 +1524,17 @@ def train_direct(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
         print(
-            f"[{name}] e={epoch:03d}/{args.epochs:03d} "
+            f"[TRAIN {name}] "
+            f"epoch={epoch:03d}/{args.epochs:03d} | "
             f"train={train_loss_value:.6f} "
-            f"val={val['loss']:.6f} "
+            f"val={val['loss']:.6f} | "
             f"ADE={val['ade_m']:.4f}m "
             f"FDE={val['fde_m']:.4f}m "
-            f"Heading={val['heading_mae_rad']:.4f}rad "
-            f"VRAM={peak_gb:.2f}GB "
-            f"time={elapsed_min:.2f}m"
+            f"Heading={val['heading_mae_rad']:.4f}rad | "
+            f"VRAM={peak_gb:.2f}GB | "
+            f"epoch_time={format_eta(epoch_sec)} | "
+            f"elapsed={format_eta(model_elapsed)} | "
+            f"model_eta={format_eta(model_eta)}"
         )
 
         if val["ade_m"] < best_ade - MIN_DELTA_ADE:
@@ -1809,6 +1835,7 @@ def train_flow(
     best_epoch = 0
     no_improve = 0
     global_step = 0
+    model_start = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -1882,7 +1909,11 @@ def train_flow(
             timestep_sampler=args.timestep_sampler,
         )
 
-        elapsed_min = (time.perf_counter() - t0) / 60.0
+        epoch_sec = time.perf_counter() - t0
+        elapsed_min = epoch_sec / 60.0
+        model_elapsed = time.perf_counter() - model_start
+        avg_epoch_sec = model_elapsed / epoch
+        model_eta = avg_epoch_sec * (args.epochs - epoch)
         peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
         row = {
@@ -1902,14 +1933,17 @@ def train_flow(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
         print(
-            f"[flow/{branch}] e={epoch:03d}/{args.epochs:03d} "
+            f"[TRAIN flow/{branch}] "
+            f"epoch={epoch:03d}/{args.epochs:03d} | "
             f"trainFM={train_loss_value:.6f} "
-            f"valFM={val['flow_mse']:.6f} "
+            f"valFM={val['flow_mse']:.6f} | "
             f"ADE={val['ade_m']:.4f}m "
             f"FDE={val['fde_m']:.4f}m "
-            f"Heading={val['heading_mae_rad']:.4f}rad "
-            f"VRAM={peak_gb:.2f}GB "
-            f"time={elapsed_min:.2f}m"
+            f"Heading={val['heading_mae_rad']:.4f}rad | "
+            f"VRAM={peak_gb:.2f}GB | "
+            f"epoch_time={format_eta(epoch_sec)} | "
+            f"elapsed={format_eta(model_elapsed)} | "
+            f"model_eta={format_eta(model_eta)}"
         )
 
         if val["ade_m"] < best_ade - MIN_DELTA_ADE:
@@ -2197,24 +2231,37 @@ def main():
     args.model_root.mkdir(parents=True, exist_ok=True)
     results = []
 
-    if "transformer" in args.families:
-        # Naming order: input / family / attention.
-        # direct_* four models first, then reasoning_* four models.
-        for branch in args.branches:
-            for architecture in args.transformer_architectures:
-                r = train_direct(
-                    architecture=architecture,
-                    branch=branch,
-                    train_manifest=train_manifest,
-                    val_manifest=val_manifest,
-                    input_dim=input_dim,
-                    cache_signature=cache_signature,
-                    device=device,
-                    args=args,
-                )
-                results.append(r)
-                save_summary(args, results)
+    total_requested_models = (
+        len(args.transformer_architectures) * len(args.branches)
+        if "transformer" in args.families
+        else 0
+    ) + (
+        len(args.branches)
+        if "flow" in args.families
+        else 0
+    )
 
+    all_models_start = time.perf_counter()
+    completed_model_times: List[float] = []
+
+    def print_overall_eta(last_model_name: str, last_model_seconds: float) -> None:
+        completed_model_times.append(float(last_model_seconds))
+        completed = len(completed_model_times)
+        avg_model_sec = sum(completed_model_times) / completed
+        remaining = max(0, total_requested_models - completed)
+        total_eta = avg_model_sec * remaining
+        total_elapsed = time.perf_counter() - all_models_start
+
+        print(
+            f"[OVERALL] completed={completed}/{total_requested_models} | "
+            f"last={last_model_name} "
+            f"({format_eta(last_model_seconds)}) | "
+            f"elapsed={format_eta(total_elapsed)} | "
+            f"eta~={format_eta(total_eta)}",
+            flush=True,
+        )
+
+    # Training order: Flow/DiT v2 first, then Transformer ablations.
     if "flow" in args.families:
         oracle_error = linear_flow_oracle_sanity_check(
             seed=args.seed,
@@ -2233,7 +2280,9 @@ def main():
         print("Oracle check :", f"PASS max_error={oracle_error:.3e}")
         print("Normalizer   :", normalizer.mode)
 
+        # Branch order follows --branches (default: direct -> reasoning).
         for branch in args.branches:
+            _model_t0 = time.perf_counter()
             r = train_flow(
                 branch=branch,
                 train_manifest=train_manifest,
@@ -2244,8 +2293,31 @@ def main():
                 device=device,
                 args=args,
             )
+            _model_sec = time.perf_counter() - _model_t0
             results.append(r)
             save_summary(args, results)
+            print_overall_eta(r["condition"], _model_sec)
+
+    if "transformer" in args.families:
+        # Naming order: input / structure / attention direction.
+        # direct_* four models first, then reasoning_* four models.
+        for branch in args.branches:
+            for architecture in args.transformer_architectures:
+                _model_t0 = time.perf_counter()
+                r = train_direct(
+                    architecture=architecture,
+                    branch=branch,
+                    train_manifest=train_manifest,
+                    val_manifest=val_manifest,
+                    input_dim=input_dim,
+                    cache_signature=cache_signature,
+                    device=device,
+                    args=args,
+                )
+                _model_sec = time.perf_counter() - _model_t0
+                results.append(r)
+                save_summary(args, results)
+                print_overall_eta(r["condition"], _model_sec)
 
     save_summary(args, results)
 

@@ -100,7 +100,7 @@ except ImportError as exc:
     ) from exc
 
 try:
-    from action_model_compare_8way import (
+    from scripts.stored.action_model_compare_8way import (
         ARCHITECTURES,
         build_action_expert,
         per_sample_metrics_np,

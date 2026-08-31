@@ -80,11 +80,11 @@ from final_train_all import (
     set_seed,
 )
 
-from action_model_compare_8way import (
+from scripts.stored.action_model_compare_8way import (
     build_action_expert as build_direct,
 )
 
-from action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     euler_sample,

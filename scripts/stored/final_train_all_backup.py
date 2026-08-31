@@ -97,7 +97,7 @@ LEGACY_E2E_CANDIDATES = (
 # ACTION MODEL IMPORTS
 # =============================================================================
 
-from action_model_compare_8way import (
+from scripts.stored.action_model_compare_8way import (
     ARCHITECTURES,
     build_action_expert as build_direct,
     count_trainable_parameters as count_direct_params,
@@ -105,7 +105,7 @@ from action_model_compare_8way import (
     trajectory_metrics_np as direct_metrics_np,
 )
 
-from action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     count_trainable_parameters as count_flow_params,

@@ -43,7 +43,7 @@ from action_model_compare import (
     per_sample_metrics_np,
     trajectory_metrics_np,
 )
-from action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     euler_sample,

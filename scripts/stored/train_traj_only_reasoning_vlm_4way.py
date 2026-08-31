@@ -60,7 +60,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import get_cosine_schedule_with_warmup
 
-from action_model_compare_8way import (
+from scripts.stored.action_model_compare_8way import (
     ARCHITECTURES,
     build_action_expert,
     count_trainable_parameters,
