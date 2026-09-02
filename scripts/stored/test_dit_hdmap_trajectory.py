@@ -153,13 +153,13 @@ DEFAULT_OUTPUT_ROOT = Path(
 # =============================================================================
 
 try:
-    from scripts.action_model_flow_dit import (
+    from scripts.stored.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,
     )
 except ImportError:
-    from action_model_flow_dit import (
+    from scripts.stored.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,

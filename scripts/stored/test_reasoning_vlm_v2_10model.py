@@ -106,20 +106,20 @@ DEFAULT_RESULT_ROOT = Path("/home/lhh/lab/E2E/Result/reasoning_vlm_v2_10model")
 # ACTION MODEL IMPORTS
 # =============================================================================
 
-from action_model_ablation_v2 import (
+from scripts.stored.action_model_ablation_v2 import (
     ARCHITECTURES,
     build_action_expert,
     trajectory_metrics_np,
 )
 
 try:
-    from scripts.action_model_flow_dit import (
+    from scripts.stored.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,
     )
 except ImportError:
-    from action_model_flow_dit import (
+    from scripts.stored.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,
