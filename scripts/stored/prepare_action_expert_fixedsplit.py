@@ -57,7 +57,7 @@ VLM_SCRIPT_DIR = HOME / "lab" / "VLM" / "scripts"
 if str(VLM_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(VLM_SCRIPT_DIR))
 
-import reasoning_v2_core as core
+import scripts.stored.reasoning_v2_core as core
 
 
 SPLIT_NAMES = ("train", "val", "test")

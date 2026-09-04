@@ -54,7 +54,7 @@ import torch
 import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
 
-from scripts.stored.action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     count_trainable_parameters,

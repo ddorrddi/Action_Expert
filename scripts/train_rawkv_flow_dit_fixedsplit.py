@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train all 10 Action Expert models using the NEW fixed-split dataset and
-the NEW Reasoning_VLM_v2_fixedsplit model.
+Train ONLY the two RAW-KV Flow-Matching / DiT Action Experts.
 
-Prepared Action Expert dataset
-------------------------------
-Create first with prepare_action_expert_fixedsplit.py:
+Models
+------
+  direct_flow_dit
+  reasoning_flow_dit
+
+Dataset / split
+---------------
+Prepared first with prepare_action_expert_fixedsplit.py:
 
     /home/lhh/lab/Dataset/ActionExpert/part1_fixedsplit/
         train.jsonl
@@ -14,49 +18,48 @@ Create first with prepare_action_expert_fixedsplit.py:
         test.jsonl
         manifest.json
 
-The prepare stage preserves the original Action Expert sample policy:
-- every valid Part1 frame
-- no task/sample cap
-- 10 x (x,y,yaw), 0.5 s interval, 5 s, current-ego frame
-- valid reasoning trace required
+The exact ~/splits_vlm.json driving-log-disjoint split is reused.
+No random split is created here.
 
-Only the split policy changes:
-- exact clip membership from ~/splits_vlm.json
-- driving-log-disjoint train/val/test
-- no old ActionExpert8 80/10/10 split
-- no new random split inside this trainer
-
-10 models
----------
-Transformer 2 x 2 x 2 ablation (8):
-  direct_encoder_bidirectional
-  direct_encoder_causal
-  direct_decoder_bidirectional
-  direct_decoder_causal
-  reasoning_encoder_bidirectional
-  reasoning_encoder_causal
-  reasoning_decoder_bidirectional
-  reasoning_decoder_causal
-
-Flow/DiT v2 (2):
-  direct_flow_dit
-  reasoning_flow_dit
-
-Important
----------
-- Frozen VLM for every branch:
+VLM conditioning
+----------------
+Frozen VLM:
     /home/lhh/lab/models/vlm/Reasoning_VLM_v2_fixedsplit
-- VLM prompt:
-    3 cameras + mission command + speed + acceleration + heading/yaw
-    + reasoning-only instruction.
-- direct:
-    prompt-boundary last-layer KV.
-- reasoning:
-    same prompt-boundary KV + target-model greedy AR reasoning KV delta.
-- DFlash is NOT used to create Action Expert training features.
-- One VLM KV cache is generated once; then the VLM is unloaded.
-- The 10 Action Experts are trained sequentially, one model at a time.
-- Training order: Flow/DiT v2 first, then Transformer ablations.
+
+Direct branch:
+    prompt-boundary last-layer RAW K and RAW V
+
+Reasoning branch:
+    same prompt RAW K/V + target-model greedy-AR reasoning RAW K/V delta
+
+IMPORTANT RAW-KV RULE
+---------------------
+VLM K/V remain separate and are reused directly as the attention prefix.
+There is NO:
+    - K/V concatenation into a feature vector
+    - KVMemoryProjector
+    - learned VLM K projection
+    - learned VLM V projection
+
+The Action Expert learns trajectory-side Q/K/V. Frozen VLM K/V are prepended
+as prefix K/V. If the VLM uses GQA, raw KV heads are only repeated by the
+standard parameter-free group-sharing rule.
+
+DiT / Flow Matching
+-------------------
+- H=1536, 13 blocks, FF=6144
+- 10 future waypoints: 10 x (x,y,yaw), 0.5 s interval, 5 s
+- normalized noisy trajectory x_t + Fourier time embedding
+- non-causal trajectory-token attention
+- frozen RAW VLM K/V prefix in every block
+- linear conditional Flow Matching:
+      x_t = (1-t) * x0 + t * x1
+      v*  = x1 - x0
+      L   = MSE(v_theta(x_t, t, KV), v*)
+- Euler sampling, default 10 solver steps
+
+This file is independent of the former 10-model runner. It trains only the two
+DiT branches sequentially: direct -> reasoning.
 """
 
 from __future__ import annotations
@@ -72,12 +75,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
@@ -97,61 +102,49 @@ for _p in (SCRIPT_DIR, ACTION_PROJECT_ROOT, ACTION_SCRIPT_DIR, VLM_SCRIPT_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-# Newly merged fixed-split VLM.
 VLM_PATH = Path(
     "/home/lhh/lab/models/vlm/Reasoning_VLM_v2_fixedsplit"
 )
 
-# Central dataset root + Action Expert fixed-split dataset.
 DATASET_ROOT = Path("/home/lhh/lab/Dataset")
-ACTION_DATASET_ROOT = (
-    DATASET_ROOT / "ActionExpert" / "part1_fixedsplit"
-)
+ACTION_DATASET_ROOT = DATASET_ROOT / "ActionExpert" / "part1_fixedsplit"
 TRAIN_JSONL = ACTION_DATASET_ROOT / "train.jsonl"
 VAL_JSONL = ACTION_DATASET_ROOT / "val.jsonl"
-TEST_JSONL = ACTION_DATASET_ROOT / "test.jsonl"
 ACTION_DATASET_MANIFEST_PATH = ACTION_DATASET_ROOT / "manifest.json"
 CENTRAL_DATASET_MANIFEST_PATH = DATASET_ROOT / "manifest.json"
-
-# Authoritative senior/base split used by the fixed-split VLM.
 SPLIT_JSON_PATH = Path("/home/lhh/splits_vlm.json")
 
-# New cache/model roots: never mix with old ActionExpert8 / old Reasoning_VLM_v2.
+# Standalone RAW-KV DiT cache/model roots.
 CACHE_ROOT = (
     DATASET_ROOT
     / "ActionExpert"
-    / "reasoning_vlm_v2_fixedsplit_10model"
+    / "reasoning_vlm_v2_fixedsplit_rawkv_dit"
     / "action_kv_cache"
 )
 MODEL_ROOT = Path(
     "/home/lhh/lab/models/action_expert/"
-    "reasoning_vlm_v2_fixedsplit_10model"
+    "reasoning_vlm_v2_fixedsplit_rawkv_dit"
 )
 
 
 # =============================================================================
-# ACTION MODEL IMPORTS
+# SHARED FLOW UTILITIES
 # =============================================================================
 
-from scripts.stored.action_model_ablation_v2 import (
-    ARCHITECTURES,
-    build_action_expert as build_direct,
-    count_trainable_parameters as count_direct_params,
-    trajectory_loss as direct_loss,
-    trajectory_metrics_np as direct_metrics_np,
-)
-
-from scripts.stored.action_model_flow_dit import (
+# Only mathematical/data utilities are reused from the existing helper.
+# The DiT model itself is defined in THIS file and does not call build_flow_dit.
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
-    build_flow_dit,
-    count_trainable_parameters as count_flow_params,
-    euler_sample,
     flow_matching_batch,
     linear_flow_oracle_sanity_check,
     trajectory_metrics_np as flow_metrics_np,
 )
 
-import reasoning_v2_core as vlm_v2_core
+import scripts.stored.reasoning_v2_core as vlm_v2_core
+
+
+def count_trainable_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 # =============================================================================
@@ -159,33 +152,17 @@ import reasoning_v2_core as vlm_v2_core
 # =============================================================================
 
 BRANCHES = ("direct", "reasoning")
-FAMILIES = ("transformer", "flow")
-
-# Final Transformer ablation:
-#   Input      : direct / reasoning
-#   Structure  : encoder / decoder
-#   Direction  : bidirectional / causal
-#
-# encoder = encoder-style fusion:
-#           projected VLM memory + trajectory queries in one self-attention stack
-# decoder = decoder-style fusion:
-#           trajectory-query stream + cross-attention to VLM memory
-#
-# direction is independent of structure and controls trajectory-query attention.
-ABLATION_AXES = {
-    "input": ("direct", "reasoning"),
-    "structure": ("encoder", "decoder"),
-    "attention_direction": ("bidirectional", "causal"),
-}
 
 SEED = 20260823
 VAL_NOISE_SEED = 20260824
 VAL_FLOW_SEED = 20260840
 
-HIDDEN_DIM = 1536
-NUM_LAYERS = 13
-NUM_HEADS = 12
-FF_DIM = 6144
+# ~0.5B RAW-KV DiT capacity.
+# With Qwen3-VL GQA geometry Hq=16, Hkv=8, head_dim=128,
+# this configuration is about 0.500B trainable parameters.
+HIDDEN_DIM = 1728
+NUM_LAYERS = 14
+FF_DIM = 7168
 DROPOUT = 0.1
 NUM_STEPS = 10
 
@@ -204,17 +181,409 @@ SOLVER_STEPS = 10
 TIMESTEP_SAMPLER = "uniform"
 
 MIN_DELTA_ADE = 1.0e-4
-HEADING_LOSS_WEIGHT = 0.5
 GRAD_CLIP_NORM = 1.0
 NORMALIZER_STD_FLOOR = 1.0e-3
 
-CACHE_VERSION = "reasoning_vlm_v2_fixedsplit_target_ar_kv_ablation_v3"
-
+CACHE_VERSION = "reasoning_vlm_v2_fixedsplit_target_ar_rawkv_dit_v1"
 PROMPT_MODE = "reasoning_v2_fixedsplit_ego_state_reasoning_only"
 ATTN_IMPLEMENTATION = "sdpa"
 MIN_PIXELS = 200_704
 MAX_PIXELS = 200_704
 CACHE_STORAGE_DTYPE = torch.bfloat16
+
+
+# =============================================================================
+# RAW-KV FLOW / DiT MODEL
+# =============================================================================
+
+class RawKVPrefixFusionAttention(nn.Module):
+    """
+    Single attention that treats frozen VLM K/V as prefix past-KV and appends
+    trainable trajectory-token K/V after that prefix.
+
+    This is the closest controlled analogue to an Alpamayo-style prefix-KV idea
+    while retaining this project's ~0.5B Action Expert and last-layer-only
+    VLM cache.
+
+    VLM K/V: used unchanged.
+    Trajectory K/V: learned from trajectory hidden states.
+    Query: learned from trajectory hidden states.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        vlm_num_attention_heads: int,
+        vlm_num_kv_heads: int,
+        vlm_head_dim: int,
+        dropout: float,
+        causal_queries: bool,
+    ):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.vlm_num_attention_heads = int(vlm_num_attention_heads)
+        self.vlm_num_kv_heads = int(vlm_num_kv_heads)
+        self.vlm_head_dim = int(vlm_head_dim)
+        if self.vlm_num_attention_heads % self.vlm_num_kv_heads != 0:
+            raise ValueError(
+                "VLM attention heads must be divisible by VLM KV heads: "
+                f"Hq={self.vlm_num_attention_heads} Hkv={self.vlm_num_kv_heads}"
+            )
+        self.kv_groups = self.vlm_num_attention_heads // self.vlm_num_kv_heads
+        self.q_attn_dim = self.vlm_num_attention_heads * self.vlm_head_dim
+        self.kv_attn_dim = self.vlm_num_kv_heads * self.vlm_head_dim
+        self.scale = self.vlm_head_dim ** -0.5
+        self.causal_queries = bool(causal_queries)
+        self.dropout_p = float(dropout)
+
+        self.q_proj = nn.Linear(hidden_dim, self.q_attn_dim, bias=False)
+        self.self_k_proj = nn.Linear(hidden_dim, self.kv_attn_dim, bias=False)
+        self.self_v_proj = nn.Linear(hidden_dim, self.kv_attn_dim, bias=False)
+        self.out_proj = nn.Linear(self.q_attn_dim, hidden_dim, bias=False)
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        vlm_key: torch.Tensor,
+        vlm_value: torch.Tensor,
+        memory_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if query_tokens.ndim != 3:
+            raise ValueError(
+                f"query_tokens must be [B,N,H], got={tuple(query_tokens.shape)}"
+            )
+        if vlm_key.ndim != 4 or vlm_value.ndim != 4:
+            raise ValueError("raw VLM K/V must be [B,H,T,D]")
+        if vlm_key.shape != vlm_value.shape:
+            raise ValueError("raw VLM K/V shape mismatch")
+        if int(vlm_key.shape[1]) != self.vlm_num_kv_heads:
+            raise ValueError("raw VLM KV head count mismatch")
+        if int(vlm_key.shape[-1]) != self.vlm_head_dim:
+            raise ValueError("raw VLM head_dim mismatch")
+        if memory_mask.shape != (vlm_key.shape[0], vlm_key.shape[2]):
+            raise ValueError("memory_mask/raw-KV shape mismatch")
+
+        b, n, _ = query_tokens.shape
+        hq = self.vlm_num_attention_heads
+        hkv = self.vlm_num_kv_heads
+        d = self.vlm_head_dim
+
+        q = self.q_proj(query_tokens).view(b, n, hq, d).transpose(1, 2)
+        self_k = self.self_k_proj(query_tokens).view(b, n, hkv, d).transpose(1, 2)
+        self_v = self.self_v_proj(query_tokens).view(b, n, hkv, d).transpose(1, 2)
+
+        raw_k = vlm_key.to(device=q.device, dtype=q.dtype)
+        raw_v = vlm_value.to(device=q.device, dtype=q.dtype)
+
+        # Exact frozen VLM KV is the prefix; no transform is applied to it.
+        # GQA head sharing repeats raw/self KV heads only; it is parameter-free.
+        k = torch.cat([raw_k, self_k], dim=2)
+        v = torch.cat([raw_v, self_v], dim=2)
+        if self.kv_groups > 1:
+            k = k.repeat_interleave(self.kv_groups, dim=1)
+            v = v.repeat_interleave(self.kv_groups, dim=1)
+
+        scores = torch.matmul(
+            q.float(),
+            k.float().transpose(-2, -1),
+        ) * self.scale
+
+        prefix_len = int(raw_k.shape[2])
+        invalid_prefix = (~memory_mask.bool())[:, None, None, :].expand(
+            b, 1, n, prefix_len
+        )
+        if self.causal_queries:
+            blocked_self = torch.triu(
+                torch.ones((n, n), dtype=torch.bool, device=scores.device),
+                diagonal=1,
+            )[None, None, :, :].expand(b, 1, n, n)
+        else:
+            blocked_self = torch.zeros(
+                (b, 1, n, n), dtype=torch.bool, device=scores.device
+            )
+        blocked = torch.cat([invalid_prefix, blocked_self], dim=-1)
+        scores = scores.masked_fill(
+            blocked,
+            torch.finfo(scores.dtype).min,
+        )
+
+        attn = torch.softmax(scores, dim=-1).to(dtype=q.dtype)
+        attn = F.dropout(
+            attn,
+            p=self.dropout_p,
+            training=self.training,
+        )
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(b, n, self.q_attn_dim)
+        return self.out_proj(out)
+
+
+
+class TrajectoryOutputHeadRawKV(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.norm(x))
+
+
+class RawKVEncoderBlock(nn.Module):
+    """Single prefix-fusion attention + FFN."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        vlm_num_attention_heads: int,
+        vlm_num_kv_heads: int,
+        vlm_head_dim: int,
+        ff_dim: int,
+        dropout: float,
+        causal_queries: bool,
+    ):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(hidden_dim)
+        self.attn = RawKVPrefixFusionAttention(
+            hidden_dim=hidden_dim,
+            vlm_num_attention_heads=vlm_num_attention_heads,
+            vlm_num_kv_heads=vlm_num_kv_heads,
+            vlm_head_dim=vlm_head_dim,
+            dropout=dropout,
+            causal_queries=causal_queries,
+        )
+        self.norm_ff = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, hidden_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        vlm_key: torch.Tensor,
+        vlm_value: torch.Tensor,
+        memory_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.norm_attn(tokens)
+        tokens = tokens + self.dropout(
+            self.attn(x, vlm_key, vlm_value, memory_mask)
+        )
+        tokens = tokens + self.dropout(self.ffn(self.norm_ff(tokens)))
+        return tokens
+
+
+
+class FourierEncoderRawKV(nn.Module):
+    def __init__(self, dim: int = 20, max_freq: float = 100.0):
+        super().__init__()
+        if dim < 2 or dim % 2 != 0:
+            raise ValueError("Fourier dim must be even and >=2")
+        half = dim // 2
+        freqs = torch.logspace(
+            0.0,
+            math.log10(float(max_freq)),
+            steps=half,
+            dtype=torch.float32,
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        arg = x.float().unsqueeze(-1) * self.freqs.float() * (2.0 * math.pi)
+        return torch.cat([torch.sin(arg), torch.cos(arg)], dim=-1) * math.sqrt(2.0)
+
+
+class FlowActionInputProjectionRawKV(nn.Module):
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dim: int,
+        time_fourier_dim: int = 20,
+        time_mlp_hidden: int = 512,
+    ):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.action_proj = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.time_encoder = FourierEncoderRawKV(time_fourier_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_fourier_dim, time_mlp_hidden),
+            nn.LayerNorm(time_mlp_hidden),
+            nn.GELU(),
+            nn.Linear(time_mlp_hidden, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x_t.ndim != 3 or x_t.shape[-1] != self.action_dim:
+            raise ValueError(f"x_t must be [B,N,{self.action_dim}]")
+        b = x_t.shape[0]
+        action_hidden = self.action_proj(
+            x_t.to(dtype=self.action_proj[0].weight.dtype)
+        )
+        if t.shape[0] != b:
+            raise ValueError("t batch mismatch")
+        t_scalar = t.reshape(b, -1)[:, 0]
+        time_feat = self.time_encoder(t_scalar)
+        time_hidden = self.time_proj(
+            time_feat.to(dtype=self.time_proj[0].weight.dtype)
+        ).unsqueeze(1)
+        return action_hidden + time_hidden
+
+
+class RawKVFlowMatchingActionExpert(nn.Module):
+    """
+    Alpamayo-like controlled Flow/DiT variant:
+      frozen raw VLM K/V prefix + non-causal trajectory-token K/V in ONE
+      prefix-fusion attention per layer; Flow Matching predicts velocity.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_steps: int,
+        num_layers: int,
+        vlm_num_attention_heads: int,
+        vlm_num_kv_heads: int,
+        vlm_head_dim: int,
+        ff_dim: int,
+        dropout: float,
+        gradient_checkpointing: bool,
+    ):
+        super().__init__()
+        self.num_steps = int(num_steps)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.action_in = FlowActionInputProjectionRawKV(3, hidden_dim)
+        self.horizon_embedding = nn.Parameter(
+            torch.randn(1, self.num_steps, hidden_dim) * 0.02
+        )
+        self.layers = nn.ModuleList([
+            RawKVEncoderBlock(
+                hidden_dim=hidden_dim,
+                vlm_num_attention_heads=vlm_num_attention_heads,
+                vlm_num_kv_heads=vlm_num_kv_heads,
+                vlm_head_dim=vlm_head_dim,
+                ff_dim=ff_dim,
+                dropout=dropout,
+                causal_queries=False,
+            )
+            for _ in range(num_layers)
+        ])
+        self.output = TrajectoryOutputHeadRawKV(hidden_dim)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        vlm_key: torch.Tensor,
+        vlm_value: torch.Tensor,
+        memory_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if x_t.ndim != 3 or tuple(x_t.shape[1:]) != (self.num_steps, 3):
+            raise ValueError(
+                f"x_t must be [B,{self.num_steps},3], got={tuple(x_t.shape)}"
+            )
+        tokens = self.action_in(x_t, t)
+        tokens = tokens + self.horizon_embedding.to(
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        for layer in self.layers:
+            if self.training and self.gradient_checkpointing:
+                tokens = checkpoint(
+                    layer,
+                    tokens,
+                    vlm_key,
+                    vlm_value,
+                    memory_mask,
+                    use_reentrant=False,
+                )
+            else:
+                tokens = layer(tokens, vlm_key, vlm_value, memory_mask)
+        return self.output(tokens)
+
+
+def build_flow_dit_rawkv(
+    hidden_dim: int,
+    num_steps: int,
+    num_layers: int,
+    vlm_num_attention_heads: int,
+    vlm_num_kv_heads: int,
+    vlm_head_dim: int,
+    ff_dim: int,
+    dropout: float,
+    gradient_checkpointing: bool,
+) -> nn.Module:
+    return RawKVFlowMatchingActionExpert(
+        hidden_dim=hidden_dim,
+        num_steps=num_steps,
+        num_layers=num_layers,
+        vlm_num_attention_heads=vlm_num_attention_heads,
+        vlm_num_kv_heads=vlm_num_kv_heads,
+        vlm_head_dim=vlm_head_dim,
+        ff_dim=ff_dim,
+        dropout=dropout,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+
+
+@torch.inference_mode()
+def euler_sample_rawkv(
+    model: nn.Module,
+    vlm_key: torch.Tensor,
+    vlm_value: torch.Tensor,
+    memory_mask: torch.Tensor,
+    normalizer: TrajectoryNormalizer,
+    solver_steps: int,
+    rng: torch.Generator,
+) -> torch.Tensor:
+    if solver_steps < 1:
+        raise ValueError("solver_steps must be >=1")
+    device = vlm_key.device
+    batch = int(vlm_key.shape[0])
+    num_steps = int(model.num_steps)
+
+    x = torch.randn(
+        (batch, num_steps, 3),
+        generator=rng,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(device=device, dtype=torch.float32)
+
+    dt = 1.0 / float(solver_steps)
+    for step in range(solver_steps):
+        t_value = float(step) / float(solver_steps)
+        t = torch.full(
+            (batch, 1, 1),
+            t_value,
+            device=device,
+            dtype=torch.float32,
+        )
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            velocity = model(
+                x_t=x,
+                t=t,
+                vlm_key=vlm_key,
+                vlm_value=vlm_value,
+                memory_mask=memory_mask,
+            )
+        x = x + dt * velocity.float()
+
+    return normalizer.to(device).denormalize(x)
+
 
 
 # =============================================================================
@@ -754,27 +1123,29 @@ def get_last_layer_kv(past_key_values):
     )
 
 
-def kv_to_sequence(
+def raw_kv_to_cpu(
     key: torch.Tensor,
     value: torch.Tensor,
     max_length: int | None = None,
-) -> torch.Tensor:
-    # [B,H,T,D] K/V -> [B,T,2*H*D]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Keep VLM K and V separate: [B,H,T,D] -> two CPU [H,T,D] tensors."""
     if key.ndim != 4 or value.ndim != 4:
         raise ValueError(
-            f"Expected K/V [B,H,T,D], "
-            f"got K={tuple(key.shape)}, V={tuple(value.shape)}"
+            f"Expected K/V [B,H,T,D], got K={tuple(key.shape)}, V={tuple(value.shape)}"
         )
-
+    if key.shape != value.shape:
+        raise ValueError(
+            f"K/V shape mismatch: K={tuple(key.shape)} V={tuple(value.shape)}"
+        )
+    if key.shape[0] != 1:
+        raise ValueError(f"Cache extraction expects batch=1, got={key.shape[0]}")
     if max_length is not None:
         key = key[..., :max_length, :]
         value = value[..., :max_length, :]
-
-    key_seq = key.permute(0, 2, 1, 3).contiguous().flatten(2)
-    value_seq = value.permute(0, 2, 1, 3).contiguous().flatten(2)
-
-    return torch.cat([key_seq, value_seq], dim=-1)
-
+    return (
+        key[0].detach().to(dtype=CACHE_STORAGE_DTYPE).cpu().contiguous(),
+        value[0].detach().to(dtype=CACHE_STORAGE_DTYPE).cpu().contiguous(),
+    )
 
 def normalize_token_id_set(value: Any) -> set[int]:
     if value is None:
@@ -853,7 +1224,16 @@ def extract_one(
     max_new_tokens,
     allow_truncated,
 ):
-    # Target-only cache extraction.
+    """
+    Extract frozen RAW last-layer VLM K and V without feature concat/projection.
+
+    direct:
+      direct_key/direct_value = prompt-boundary last-layer raw K/V
+
+    reasoning:
+      reasoning_delta_key/reasoning_delta_value = raw K/V belonging only to
+      generated reasoning content tokens.
+    """
     reset_multimodal_rope_state(model)
 
     batch = build_prompt_v2(
@@ -862,10 +1242,9 @@ def extract_one(
         device=device,
         dtype=dtype,
     )
-
     prompt_token_length = int(batch["input_ids"].shape[1])
 
-    # 1) Prompt-boundary KV, immediately before reasoning generation.
+    # 1) Prompt-boundary RAW K/V.
     with torch.autocast(
         device_type="cuda",
         dtype=dtype,
@@ -877,34 +1256,34 @@ def extract_one(
             return_dict=True,
         )
 
-    direct_key, direct_value = get_last_layer_kv(
-        prompt_out.past_key_values
+    prompt_key, prompt_value = get_last_layer_kv(prompt_out.past_key_values)
+    prompt_cache_length = int(prompt_key.shape[-2])
+    direct_key, direct_value = raw_kv_to_cpu(
+        prompt_key,
+        prompt_value,
+        max_length=prompt_cache_length,
     )
-    prompt_cache_length = int(direct_key.shape[-2])
-
-    direct_kv = (
-        kv_to_sequence(
-            direct_key,
-            direct_value,
-            max_length=prompt_cache_length,
-        )[0]
-        .detach()
-        .to(dtype=CACHE_STORAGE_DTYPE)
-        .cpu()
-        .contiguous()
+    text_cfg = getattr(model.config, "text_config", model.config)
+    vlm_num_attention_heads = int(
+        getattr(text_cfg, "num_attention_heads", direct_key.shape[0])
     )
+    vlm_num_kv_heads = int(direct_key.shape[0])
+    vlm_head_dim = int(direct_key.shape[-1])
+    if vlm_num_attention_heads % vlm_num_kv_heads != 0:
+        raise RuntimeError(
+            f"Unsupported VLM GQA geometry: Hq={vlm_num_attention_heads} "
+            f"Hkv={vlm_num_kv_heads}"
+        )
 
-    del prompt_out, direct_key, direct_value
+    del prompt_out, prompt_key, prompt_value
 
-    # 2) Plain target-model greedy autoregressive reasoning.
-    #    No DFlash / speculative decoding.
+    # 2) Plain target-model greedy AR reasoning.
     generation_kwargs = {
         "max_new_tokens": int(max_new_tokens),
         "do_sample": False,
         "use_cache": True,
         "return_dict_in_generate": True,
     }
-
     pad_token_id = getattr(processor.tokenizer, "pad_token_id", None)
     if pad_token_id is not None:
         generation_kwargs["pad_token_id"] = int(pad_token_id)
@@ -919,34 +1298,20 @@ def extract_one(
             **generation_kwargs,
         )
 
-    generation_cache = getattr(
-        generation,
-        "past_key_values",
-        None,
-    )
+    generation_cache = getattr(generation, "past_key_values", None)
     if generation_cache is None:
-        raise RuntimeError(
-            "Target model generate() did not return past_key_values."
-        )
-
+        raise RuntimeError("Target model generate() did not return past_key_values.")
     sequences = getattr(generation, "sequences", None)
     if sequences is None:
         raise RuntimeError("Target model generate() returned no sequences")
 
     new_ids = sequences[0, prompt_token_length:]
-    content_ids, ended_eos = reasoning_content_ids(
-        processor,
-        model,
-        new_ids,
-    )
-
+    content_ids, ended_eos = reasoning_content_ids(processor, model, new_ids)
     if not content_ids:
         raise RuntimeError("Generated reasoning is empty")
-
     if not ended_eos and not allow_truncated:
         raise RuntimeError(
-            f"Reasoning did not terminate within "
-            f"max_new_tokens={max_new_tokens}. "
+            f"Reasoning did not terminate within max_new_tokens={max_new_tokens}. "
             "Increase --max-new-tokens or use --allow-truncated."
         )
 
@@ -955,107 +1320,91 @@ def extract_one(
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     ).strip()
-
     if not reasoning_text:
         raise RuntimeError("Decoded reasoning text is empty")
 
     gen_key, gen_value = get_last_layer_kv(generation_cache)
     generation_cache_length = int(gen_key.shape[-2])
+    if int(gen_key.shape[1]) != vlm_num_kv_heads or int(gen_key.shape[-1]) != vlm_head_dim:
+        raise RuntimeError("Prompt/generation raw-KV geometry mismatch")
 
     desired_reasoning_end = prompt_cache_length + len(content_ids)
-    usable_reasoning_end = min(
-        generation_cache_length,
-        desired_reasoning_end,
-    )
-    missing = max(
-        0,
-        desired_reasoning_end - generation_cache_length,
-    )
+    usable_reasoning_end = min(generation_cache_length, desired_reasoning_end)
+    missing = max(0, desired_reasoning_end - generation_cache_length)
 
     if ended_eos and missing > 0:
         raise RuntimeError(
             "Target AR cache does not contain all reasoning tokens: "
-            f"missing={missing}, "
-            f"prompt_cache={prompt_cache_length}, "
-            f"reasoning_tokens={len(content_ids)}, "
-            f"generation_cache={generation_cache_length}"
+            f"missing={missing}, prompt_cache={prompt_cache_length}, "
+            f"reasoning_tokens={len(content_ids)}, generation_cache={generation_cache_length}"
         )
-
     if missing > 1:
-        raise RuntimeError(
-            f"Target AR cache is too short by {missing} tokens"
-        )
+        raise RuntimeError(f"Target AR cache is too short by {missing} tokens")
 
-    full_kv = (
-        kv_to_sequence(
-            gen_key,
-            gen_value,
-            max_length=usable_reasoning_end,
-        )[0]
-        .detach()
-    )
-
-    prefix_len = min(
-        prompt_cache_length,
-        int(full_kv.shape[0]),
-    )
+    # Compare raw prompt K/V from prefill vs prefix portion of generation cache.
+    prefix_len = min(prompt_cache_length, int(gen_key.shape[-2]))
     if prefix_len <= 0:
         raise RuntimeError("Invalid zero-length prompt KV")
 
-    prefix_diff = float(
-        (
-            full_kv[:prefix_len].float().cpu()
-            - direct_kv[:prefix_len].float()
-        )
-        .abs()
-        .max()
-        .item()
-    )
+    gen_prefix_key = gen_key[0, :, :prefix_len, :].detach().float().cpu()
+    gen_prefix_value = gen_value[0, :, :prefix_len, :].detach().float().cpu()
+    key_diff = (
+        gen_prefix_key - direct_key[:, :prefix_len, :].float()
+    ).abs().max().item()
+    value_diff = (
+        gen_prefix_value - direct_value[:, :prefix_len, :].float()
+    ).abs().max().item()
+    prefix_diff = float(max(key_diff, value_diff))
 
-    reasoning_delta = full_kv[
-        prompt_cache_length:usable_reasoning_end
-    ]
-
-    if reasoning_delta.shape[0] <= 0:
-        raise RuntimeError("No reasoning KV tokens were cached")
-
-    reasoning_delta_kv = (
-        reasoning_delta
+    reasoning_delta_key = (
+        gen_key[0, :, prompt_cache_length:usable_reasoning_end, :]
+        .detach()
         .to(dtype=CACHE_STORAGE_DTYPE)
         .cpu()
         .contiguous()
     )
+    reasoning_delta_value = (
+        gen_value[0, :, prompt_cache_length:usable_reasoning_end, :]
+        .detach()
+        .to(dtype=CACHE_STORAGE_DTYPE)
+        .cpu()
+        .contiguous()
+    )
+    if reasoning_delta_key.shape[1] <= 0:
+        raise RuntimeError("No reasoning raw-KV tokens were cached")
+    if reasoning_delta_key.shape != reasoning_delta_value.shape:
+        raise RuntimeError("Reasoning raw K/V shape mismatch")
 
-    trajectory = torch.as_tensor(
-        row["trajectory"],
-        dtype=torch.float32,
-    ).cpu()
-
+    trajectory = torch.as_tensor(row["trajectory"], dtype=torch.float32).cpu()
     if tuple(trajectory.shape) != (NUM_STEPS, 3):
-        raise ValueError(
-            f"Bad trajectory shape: {tuple(trajectory.shape)}"
-        )
+        raise ValueError(f"Bad trajectory shape: {tuple(trajectory.shape)}")
 
     return {
         "cache_version": CACHE_VERSION,
         "id": str(row["id"]),
         "clip": str(row.get("clip", "")),
-        "direct_kv": direct_kv,
-        "reasoning_delta_kv": reasoning_delta_kv,
+        "direct_key": direct_key,
+        "direct_value": direct_value,
+        "reasoning_delta_key": reasoning_delta_key,
+        "reasoning_delta_value": reasoning_delta_value,
         "trajectory": trajectory.contiguous(),
+        "vlm_num_attention_heads": vlm_num_attention_heads,
+        "vlm_num_kv_heads": vlm_num_kv_heads,
+        "vlm_head_dim": vlm_head_dim,
         "prompt_token_length": int(prompt_token_length),
         "prompt_cache_length": int(prompt_cache_length),
         "reasoning_generated_tokens": int(len(content_ids)),
-        "reasoning_cached_tokens": int(reasoning_delta_kv.shape[0]),
+        "reasoning_cached_tokens": int(reasoning_delta_key.shape[1]),
         "generation_cache_length": int(generation_cache_length),
         "generation_ended": bool(ended_eos),
         "missing_reasoning_cache_tokens": int(missing),
-        "prefix_max_abs_diff": float(prefix_diff),
+        "prefix_max_abs_diff": prefix_diff,
         "reasoning_token_ids": [int(x) for x in content_ids],
         "reasoning_text": reasoning_text,
         "vlm": str(VLM_PATH),
         "prompt_mode": PROMPT_MODE,
         "decode_backend": "target_autoregressive",
+        "memory_mode": "raw_last_layer_kv_separate",
         "dflash_used": False,
     }
 
@@ -1096,6 +1445,7 @@ def cache_request(args) -> Dict[str, Any]:
         "prompt_mode": PROMPT_MODE,
         "decode_backend": "target_autoregressive",
         "dflash_used": False,
+        "memory_mode": "raw_last_layer_kv_separate",
         "attn_implementation": ATTN_IMPLEMENTATION,
     }
 
@@ -1150,7 +1500,7 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
             return reused
         raise RuntimeError(
             f"Incompatible existing cache: {args.cache_root}\n"
-            "This cache must be rebuilt with target-only AR extraction.\n"
+            "This cache must be rebuilt in RAW-KV format.\n"
             "Use --rebuild-cache."
         )
 
@@ -1159,7 +1509,7 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
     args.cache_root.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 120)
-    print("STAGE 1 | Reasoning_VLM_v2_fixedsplit TARGET-ONLY KV CACHE")
+    print("STAGE 1 | Reasoning_VLM_v2_fixedsplit TARGET-ONLY RAW K/V CACHE")
     print("=" * 120)
     print("VLM         :", args.vlm)
     print("Prompt      :", PROMPT_MODE)
@@ -1167,6 +1517,7 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
     print("DFlash      : NOT USED")
     print("Attention   :", ATTN_IMPLEMENTATION)
     print("Train / Val :", len(train_rows), "/", len(val_rows))
+    print("Memory mode : RAW VLM K/V, separate, no projector")
     print("Cache root  :", args.cache_root)
 
     model, processor = load_target_model(
@@ -1205,7 +1556,9 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
                 "id": sid,
                 "clip": str(row.get("clip", "")),
                 "cache_file": str(out_path),
-                "kv_dim": int(record["direct_kv"].shape[-1]),
+                "vlm_num_attention_heads": int(record["vlm_num_attention_heads"]),
+                "vlm_num_kv_heads": int(record["vlm_num_kv_heads"]),
+                "vlm_head_dim": int(record["vlm_head_dim"]),
                 "prompt_cache_length": int(record["prompt_cache_length"]),
                 "reasoning_cached_tokens": int(
                     record["reasoning_cached_tokens"]
@@ -1225,9 +1578,10 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
                 f"[CACHE {split.upper():5s}] "
                 f"{index:04d}/{len(rows):04d} | "
                 f"id={sid} | "
-                f"directT={record['direct_kv'].shape[0]} "
-                f"reasonT={record['reasoning_delta_kv'].shape[0]} "
-                f"D={record['direct_kv'].shape[-1]} | "
+                f"directT={record['direct_key'].shape[1]} "
+                f"reasonT={record['reasoning_delta_key'].shape[1]} "
+                f"Hq/Hkv={record['vlm_num_attention_heads']}/{record['vlm_num_kv_heads']} "
+                f"D={record['vlm_head_dim']} | "
                 f"sample={sample_sec:.2f}s | "
                 f"avg={avg_sec:.2f}s/sample | "
                 f"elapsed={format_eta(split_elapsed)} | "
@@ -1246,9 +1600,10 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
 
     meta = {
         "request": cache_request(args),
-        "runtime": "Reasoning_VLM_v2_fixedsplit target-only AR",
+        "runtime": "Reasoning_VLM_v2_fixedsplit target-only AR RAW-KV",
         "decode_backend": "target_autoregressive",
         "dflash_used": False,
+        "memory_mode": "raw_last_layer_kv_separate",
         "prompt_mode": PROMPT_MODE,
         "attention_implementation": ATTN_IMPLEMENTATION,
         "last_hidden_layer": n_layers - 1,
@@ -1289,62 +1644,82 @@ class BranchDataset(Dataset):
             weights_only=False,
         )
 
-        direct = cache["direct_kv"]
-        delta = cache["reasoning_delta_kv"]
+        direct_key = cache["direct_key"]
+        direct_value = cache["direct_value"]
+        delta_key = cache["reasoning_delta_key"]
+        delta_value = cache["reasoning_delta_value"]
         gt = cache["trajectory"].float()
 
-        if direct.ndim != 2 or delta.ndim != 2:
-            raise RuntimeError(f"Bad KV rank id={item['id']}")
-        if direct.shape[-1] != delta.shape[-1]:
-            raise RuntimeError(f"KV dim mismatch id={item['id']}")
+        for name, tensor in (
+            ("direct_key", direct_key),
+            ("direct_value", direct_value),
+            ("delta_key", delta_key),
+            ("delta_value", delta_value),
+        ):
+            if tensor.ndim != 3:
+                raise RuntimeError(
+                    f"{name} must be [H,T,D] id={item['id']}, got={tuple(tensor.shape)}"
+                )
+
+        if direct_key.shape != direct_value.shape:
+            raise RuntimeError(f"Direct raw K/V mismatch id={item['id']}")
+        if delta_key.shape != delta_value.shape:
+            raise RuntimeError(f"Reasoning raw K/V mismatch id={item['id']}")
+        if direct_key.shape[0] != delta_key.shape[0] or direct_key.shape[2] != delta_key.shape[2]:
+            raise RuntimeError(f"Direct/reasoning raw-KV geometry mismatch id={item['id']}")
 
         if self.branch == "direct":
-            memory = direct
-            segment_ids = torch.zeros(direct.shape[0], dtype=torch.long)
+            key = direct_key
+            value = direct_value
         else:
-            memory = torch.cat([direct, delta], dim=0)
-            segment_ids = torch.cat([
-                torch.zeros(direct.shape[0], dtype=torch.long),
-                torch.ones(delta.shape[0], dtype=torch.long),
-            ])
+            # Token-axis append only. K and V stay separate and unchanged.
+            key = torch.cat([direct_key, delta_key], dim=1)
+            value = torch.cat([direct_value, delta_value], dim=1)
 
         return {
             "id": str(item["id"]),
-            "memory": memory,
-            "segment_ids": segment_ids,
+            "vlm_key": key,
+            "vlm_value": value,
             "trajectory": gt,
         }
 
 
 def collate_kv(items):
     bs = len(items)
-    max_len = max(int(x["memory"].shape[0]) for x in items)
-    dim = int(items[0]["memory"].shape[1])
-    dtype = items[0]["memory"].dtype
+    num_kv_heads = int(items[0]["vlm_key"].shape[0])
+    head_dim = int(items[0]["vlm_key"].shape[2])
+    max_len = max(int(x["vlm_key"].shape[1]) for x in items)
+    dtype = items[0]["vlm_key"].dtype
 
-    memory = torch.zeros((bs, max_len, dim), dtype=dtype)
+    key = torch.zeros(
+        (bs, num_kv_heads, max_len, head_dim),
+        dtype=dtype,
+    )
+    value = torch.zeros_like(key)
     mask = torch.zeros((bs, max_len), dtype=torch.bool)
-    seg = torch.zeros((bs, max_len), dtype=torch.long)
 
     trajectories = []
     ids = []
 
     for i, item in enumerate(items):
-        x = item["memory"]
-        if int(x.shape[1]) != dim:
-            raise RuntimeError("KV dim mismatch inside batch")
-        n = int(x.shape[0])
-        memory[i, :n] = x
+        k = item["vlm_key"]
+        v = item["vlm_value"]
+        if k.shape != v.shape:
+            raise RuntimeError("raw K/V mismatch inside batch")
+        if int(k.shape[0]) != num_kv_heads or int(k.shape[2]) != head_dim:
+            raise RuntimeError("raw-KV geometry mismatch inside batch")
+        n = int(k.shape[1])
+        key[i, :, :n, :] = k
+        value[i, :, :n, :] = v
         mask[i, :n] = True
-        seg[i, :n] = item["segment_ids"]
         trajectories.append(item["trajectory"])
         ids.append(item["id"])
 
     return {
         "id": ids,
-        "memory": memory,
+        "vlm_key": key,
+        "vlm_value": value,
         "memory_mask": mask,
-        "segment_ids": seg,
         "trajectory": torch.stack(trajectories),
     }
 
@@ -1369,362 +1744,59 @@ def build_loader(manifest, branch, batch_size, shuffle, seed):
 
 
 def move_batch(batch, device):
+    # Keep cached RAW K/V in BF16. Attention casts them only to the Q dtype;
+    # there is no learned K/V transform.
     inputs = {
-        "memory": batch["memory"].to(
-            device, dtype=torch.float32, non_blocking=True
+        "vlm_key": batch["vlm_key"].to(
+            device=device,
+            dtype=CACHE_STORAGE_DTYPE,
+            non_blocking=True,
+        ),
+        "vlm_value": batch["vlm_value"].to(
+            device=device,
+            dtype=CACHE_STORAGE_DTYPE,
+            non_blocking=True,
         ),
         "memory_mask": batch["memory_mask"].to(
-            device, non_blocking=True
-        ),
-        "segment_ids": batch["segment_ids"].to(
-            device, non_blocking=True
+            device=device,
+            non_blocking=True,
         ),
     }
     gt = batch["trajectory"].to(
-        device, dtype=torch.float32, non_blocking=True
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
     )
     return inputs, gt
 
 
-def infer_input_dim(manifest):
+def infer_kv_geometry(manifest) -> Tuple[int, int, int]:
     cache = torch.load(
         manifest[0]["cache_file"],
         map_location="cpu",
         weights_only=False,
     )
-    direct = cache["direct_kv"]
-    delta = cache["reasoning_delta_kv"]
-    if direct.shape[-1] != delta.shape[-1]:
-        raise RuntimeError("direct/delta KV dim mismatch")
-    return int(direct.shape[-1])
+    dk = cache["direct_key"]
+    dv = cache["direct_value"]
+    rk = cache["reasoning_delta_key"]
+    rv = cache["reasoning_delta_value"]
+    if dk.shape != dv.shape or rk.shape != rv.shape:
+        raise RuntimeError("raw K/V shape mismatch")
+    if dk.ndim != 3 or rk.ndim != 3:
+        raise RuntimeError("raw K/V must be [H,T,D]")
+    if dk.shape[0] != rk.shape[0] or dk.shape[2] != rk.shape[2]:
+        raise RuntimeError("direct/reasoning raw-KV geometry mismatch")
+    hq = int(cache.get("vlm_num_attention_heads", dk.shape[0]))
+    hkv = int(dk.shape[0])
+    d = int(dk.shape[2])
+    if hq % hkv != 0:
+        raise RuntimeError(f"Invalid cached GQA geometry Hq={hq} Hkv={hkv}")
+    return hq, hkv, d
 
-
-# =============================================================================
-# DIRECT TRANSFORMER
-# =============================================================================
-
-@torch.inference_mode()
-def eval_direct(model, loader, device):
-    model.eval()
-    loss_sum = 0.0
-    n = 0
-    preds, gts = [], []
-
-    for batch in loader:
-        inputs, gt = move_batch(batch, device)
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
-            pred = model(**inputs)
-
-        loss, _, _ = direct_loss(
-            pred, gt, heading_weight=HEADING_LOSS_WEIGHT
-        )
-
-        bs = int(gt.shape[0])
-        loss_sum += float(loss.item()) * bs
-        n += bs
-        preds.append(pred.float().cpu().numpy())
-        gts.append(gt.float().cpu().numpy())
-
-    pred_np = np.concatenate(preds, axis=0)
-    gt_np = np.concatenate(gts, axis=0)
-    metrics = direct_metrics_np(pred_np, gt_np)
-    metrics["loss"] = loss_sum / n
-    return metrics
-
-
-def train_direct(
-    architecture,
-    branch,
-    train_manifest,
-    val_manifest,
-    input_dim,
-    cache_signature,
-    device,
-    args,
-):
-    set_seed(args.seed)
-
-    train_ds, train_dl = build_loader(
-        train_manifest, branch, args.batch_size, True, args.seed
-    )
-    val_ds, val_dl = build_loader(
-        val_manifest, branch, args.batch_size, False, args.seed
-    )
-
-    model = build_direct(
-        architecture=architecture,
-        input_dim=input_dim,
-        hidden_dim=args.hidden_dim,
-        num_steps=NUM_STEPS,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        ff_dim=args.ff_dim,
-        dropout=args.dropout,
-        gradient_checkpointing=not args.no_gradient_checkpointing,
-    ).to(device=device, dtype=torch.float32)
-
-    params = count_direct_params(model)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        foreach=False,
-    )
-
-    steps_per_epoch = math.ceil(len(train_dl) / args.grad_accum)
-    total_steps = max(1, steps_per_epoch * args.epochs)
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
-
-    name = f"{branch}_{architecture}"
-    out_dir = args.model_root / "transformer" / name
-
-    if out_dir.exists() and args.overwrite_models:
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    best_path = out_dir / "best.pt"
-    history_path = out_dir / "history.jsonl"
-
-    if best_path.exists() and not args.overwrite_models:
-        raise RuntimeError(
-            f"{best_path} already exists. Use --overwrite-models."
-        )
-    if history_path.exists():
-        history_path.unlink()
-
-    config = {
-        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
-        "family": "transformer",
-        "condition": name,
-        "branch": branch,
-        "architecture": architecture,
-        "structure": architecture.split("_", 1)[0],
-        "attention_direction": architecture.split("_", 1)[1],
-        "vlm": str(args.vlm),
-        "prompt_mode": PROMPT_MODE,
-        "input_dim": input_dim,
-        "hidden_dim": args.hidden_dim,
-        "num_steps": NUM_STEPS,
-        "num_layers": args.num_layers,
-        "num_heads": args.num_heads,
-        "ff_dim": args.ff_dim,
-        "dropout": args.dropout,
-        "trainable_params": params,
-        "train_samples": len(train_ds),
-        "val_samples": len(val_ds),
-        "batch_size": args.batch_size,
-        "grad_accum": args.grad_accum,
-        "effective_batch_size": args.batch_size * args.grad_accum,
-        "epochs": args.epochs,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
-        "patience": args.patience,
-        "seed": args.seed,
-        "precision": "fp32_master_bf16_autocast",
-        "selection_metric": "val_ade_m",
-        "cache_signature": cache_signature,
-    }
-    (out_dir / "config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    print("\n" + "=" * 120)
-    print(f"TRAIN TRANSFORMER | {name}")
-    print("=" * 120)
-    print("Train / Val :", len(train_ds), "/", len(val_ds))
-    print("Architecture:", architecture)
-    print("Branch      :", branch)
-    print("Params      :", f"{params:,} ({params/1e9:.6f}B)")
-    print("Checkpoint  :", best_path)
-
-    best_ade = math.inf
-    best_epoch = 0
-    no_improve = 0
-    global_step = 0
-    model_start = time.perf_counter()
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        torch.cuda.reset_peak_memory_stats(device)
-        optimizer.zero_grad(set_to_none=True)
-
-        train_loss_sum = 0.0
-        train_n = 0
-        t0 = time.perf_counter()
-
-        for micro_idx, batch in enumerate(train_dl, 1):
-            inputs, gt = move_batch(batch, device)
-
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=device.type == "cuda",
-            ):
-                pred = model(**inputs)
-
-            loss, _, _ = direct_loss(
-                pred, gt, heading_weight=HEADING_LOSS_WEIGHT
-            )
-
-            if not torch.isfinite(loss):
-                raise RuntimeError(
-                    f"Non-finite loss {name} e={epoch} micro={micro_idx}"
-                )
-
-            (loss / args.grad_accum).backward()
-
-            bs = int(gt.shape[0])
-            train_loss_sum += float(loss.detach().item()) * bs
-            train_n += bs
-
-            if (
-                micro_idx % args.grad_accum == 0
-                or micro_idx == len(train_dl)
-            ):
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), GRAD_CLIP_NORM
-                )
-                if not torch.isfinite(torch.as_tensor(grad_norm)):
-                    raise RuntimeError(f"Non-finite grad norm {name}")
-
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-        train_loss_value = train_loss_sum / train_n
-        val = eval_direct(model, val_dl, device)
-
-        epoch_sec = time.perf_counter() - t0
-        elapsed_min = epoch_sec / 60.0
-        model_elapsed = time.perf_counter() - model_start
-        avg_epoch_sec = model_elapsed / epoch
-        model_eta = avg_epoch_sec * (args.epochs - epoch)
-        peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-
-        row = {
-            "condition": name,
-            "epoch": epoch,
-            "global_step": global_step,
-            "train_loss": train_loss_value,
-            "val_loss": float(val["loss"]),
-            "val_ade_m": float(val["ade_m"]),
-            "val_fde_m": float(val["fde_m"]),
-            "val_heading_mae_rad": float(val["heading_mae_rad"]),
-            "lr": float(scheduler.get_last_lr()[0]),
-            "peak_vram_gb": peak_gb,
-            "epoch_minutes": elapsed_min,
-        }
-        with history_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-        print(
-            f"[TRAIN {name}] "
-            f"epoch={epoch:03d}/{args.epochs:03d} | "
-            f"train={train_loss_value:.6f} "
-            f"val={val['loss']:.6f} | "
-            f"ADE={val['ade_m']:.4f}m "
-            f"FDE={val['fde_m']:.4f}m "
-            f"Heading={val['heading_mae_rad']:.4f}rad | "
-            f"VRAM={peak_gb:.2f}GB | "
-            f"epoch_time={format_eta(epoch_sec)} | "
-            f"elapsed={format_eta(model_elapsed)} | "
-            f"model_eta={format_eta(model_eta)}"
-        )
-
-        if val["ade_m"] < best_ade - MIN_DELTA_ADE:
-            best_ade = float(val["ade_m"])
-            best_epoch = epoch
-            no_improve = 0
-
-            torch.save({
-                "experiment": "reasoning_vlm_v2_fixedsplit_10model",
-                "family": "transformer",
-                "condition": name,
-                "branch": branch,
-                "architecture": architecture,
-                "structure": architecture.split("_", 1)[0],
-                "attention_direction": architecture.split("_", 1)[1],
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "input_dim": input_dim,
-                "action_config": {
-                    "hidden_dim": args.hidden_dim,
-                    "num_steps": NUM_STEPS,
-                    "num_layers": args.num_layers,
-                    "num_heads": args.num_heads,
-                    "ff_dim": args.ff_dim,
-                    "dropout": args.dropout,
-                    "gradient_checkpointing": (
-                        not args.no_gradient_checkpointing
-                    ),
-                },
-                "trainable_params": params,
-                "cache_signature": cache_signature,
-                "vlm": str(args.vlm),
-                "prompt_mode": PROMPT_MODE,
-                "val_metrics": val,
-            }, best_path)
-
-            print(
-                f"[{name}] BEST -> epoch={epoch} "
-                f"ADE={best_ade:.6f} saved={best_path}"
-            )
-        else:
-            no_improve += 1
-            print(
-                f"[{name}] no ADE improvement "
-                f"{no_improve}/{args.patience} "
-                f"(best={best_ade:.6f})"
-            )
-
-        if no_improve >= args.patience:
-            print(
-                f"[{name}] EARLY STOP | "
-                f"best_epoch={best_epoch} best_ADE={best_ade:.6f}"
-            )
-            break
-
-    best = torch.load(best_path, map_location="cpu", weights_only=False)
-
-    result = {
-        "family": "transformer",
-        "condition": name,
-        "branch": branch,
-        "architecture": architecture,
-        "best_epoch": int(best["epoch"]),
-        "trainable_params": int(params),
-        **{
-            f"val_{k}": float(v)
-            for k, v in best["val_metrics"].items()
-        },
-        "checkpoint": str(best_path),
-    }
-
-    del (
-        best, model, optimizer, scheduler,
-        train_dl, val_dl, train_ds, val_ds
-    )
-    cleanup_cuda()
-    return result
 
 
 # =============================================================================
-# FLOW / DiT v2
+# FLOW / DiT TRAINING
 # =============================================================================
 
 def compute_normalizer(train_manifest):
@@ -1803,11 +1875,11 @@ def eval_flow(
         loss_sum += float(fm_loss.item()) * bs
         n += bs
 
-        pred = euler_sample(
+        pred = euler_sample_rawkv(
             model=model,
-            memory=inputs["memory"],
+            vlm_key=inputs["vlm_key"],
+            vlm_value=inputs["vlm_value"],
             memory_mask=inputs["memory_mask"],
-            segment_ids=inputs["segment_ids"],
             normalizer=norm,
             solver_steps=solver_steps,
             rng=noise_rng,
@@ -1827,7 +1899,9 @@ def train_flow(
     branch,
     train_manifest,
     val_manifest,
-    input_dim,
+    vlm_num_attention_heads,
+    vlm_num_kv_heads,
+    vlm_head_dim,
     cache_signature,
     normalizer,
     device,
@@ -1842,18 +1916,19 @@ def train_flow(
         val_manifest, branch, args.batch_size, False, args.seed
     )
 
-    model = build_flow_dit(
-        input_dim=input_dim,
+    model = build_flow_dit_rawkv(
         hidden_dim=args.hidden_dim,
         num_steps=NUM_STEPS,
         num_layers=args.num_layers,
-        num_heads=args.num_heads,
+        vlm_num_attention_heads=vlm_num_attention_heads,
+        vlm_num_kv_heads=vlm_num_kv_heads,
+        vlm_head_dim=vlm_head_dim,
         ff_dim=args.ff_dim,
         dropout=args.dropout,
         gradient_checkpointing=not args.no_gradient_checkpointing,
     ).to(device=device, dtype=torch.float32)
 
-    params = count_flow_params(model)
+    params = count_trainable_parameters(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1888,22 +1963,23 @@ def train_flow(
         history_path.unlink()
 
     config = {
-        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
+        "experiment": "reasoning_vlm_v2_fixedsplit_rawkv_dit",
         "family": "flow_dit_v2",
         "branch": branch,
         "vlm": str(args.vlm),
         "prompt_mode": PROMPT_MODE,
-        "conditioning": "KVMemoryProjector + decoder cross-attention",
+        "conditioning": "frozen raw VLM K/V prefix, no K/V projection",
         "objective": "linear_flow_matching_velocity_mse",
         "flow_path": "x_t=(1-t)*x0+t*x1; target=x1-x0",
         "action_input": "raw_normalized_xt_linear_plus_fourier_t",
         "normalization": "per_waypoint_xyz_train_only",
-        "self_attention": "non_causal",
-        "input_dim": input_dim,
+        "self_attention": "non_causal prefix-fusion with raw VLM KV",
+        "vlm_num_attention_heads": vlm_num_attention_heads,
+        "vlm_num_kv_heads": vlm_num_kv_heads,
+        "vlm_head_dim": vlm_head_dim,
         "hidden_dim": args.hidden_dim,
         "num_steps": NUM_STEPS,
         "num_layers": args.num_layers,
-        "num_heads": args.num_heads,
         "ff_dim": args.ff_dim,
         "dropout": args.dropout,
         "trainable_params": params,
@@ -2061,13 +2137,15 @@ def train_flow(
             no_improve = 0
 
             torch.save({
-                "experiment": "reasoning_vlm_v2_fixedsplit_10model",
+                "experiment": "reasoning_vlm_v2_fixedsplit_rawkv_dit",
                 "family": "flow_dit_v2",
                 "version": 2,
                 "branch": branch,
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "input_dim": input_dim,
+                "vlm_num_attention_heads": vlm_num_attention_heads,
+        "vlm_num_kv_heads": vlm_num_kv_heads,
+        "vlm_head_dim": vlm_head_dim,
                 "trainable_params": params,
                 "cache_signature": cache_signature,
                 "vlm": str(args.vlm),
@@ -2078,16 +2156,15 @@ def train_flow(
                     "hidden_dim": args.hidden_dim,
                     "num_steps": NUM_STEPS,
                     "num_layers": args.num_layers,
-                    "num_heads": args.num_heads,
-                    "ff_dim": args.ff_dim,
+                                "ff_dim": args.ff_dim,
                     "dropout": args.dropout,
                     "gradient_checkpointing": (
                         not args.no_gradient_checkpointing
                     ),
                     "solver_steps": args.solver_steps,
                     "timestep_sampler": args.timestep_sampler,
-                    "conditioning": "KVMemoryProjector + decoder cross-attention",
-                    "self_attention": "non_causal",
+                    "conditioning": "frozen raw VLM K/V prefix, no K/V projection",
+                    "self_attention": "non_causal prefix-fusion with raw VLM KV",
                     "flow_path": "x_t=(1-t)*x0+t*x1; target=x1-x0",
                     "action_input": "raw_normalized_xt_linear_plus_fourier_t",
                     "normalization": "per_waypoint_xyz_train_only",
@@ -2140,6 +2217,8 @@ def train_flow(
     return result
 
 
+
+
 # =============================================================================
 # SUMMARY
 # =============================================================================
@@ -2148,44 +2227,40 @@ def save_summary(args, results):
     args.model_root.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
+        "experiment": "reasoning_vlm_v2_fixedsplit_rawkv_dit",
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "vlm": str(args.vlm),
-        "dataset_root": str(DATASET_ROOT),
+        "dataset_root": str(ACTION_DATASET_ROOT),
         "split_json": str(SPLIT_JSON_PATH),
         "prompt_mode": PROMPT_MODE,
         "cache_root": str(args.cache_root),
         "results": results,
     }
-
     (args.model_root / "summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
     lines = [
-        "=" * 130,
-        "Reasoning_VLM_v2_fixedsplit | ACTION EXPERT 2x2x2 ABLATION SUMMARY",
-        "=" * 130,
+        "=" * 120,
+        "Reasoning_VLM_v2_fixedsplit | RAW-KV Flow/DiT SUMMARY",
+        "=" * 120,
         f"VLM   : {args.vlm}",
         f"Cache : {args.cache_root}",
         "",
-        f"{'FAMILY':<13}{'CONDITION':<38}{'PARAMS(B)':>12}"
-        f"{'BEST_E':>9}{'ADE':>11}{'FDE':>11}{'HEAD':>11}",
-        "-" * 130,
+        f"{'CONDITION':<30}{'PARAMS(B)':>12}{'BEST_E':>9}"
+        f"{'ADE':>11}{'FDE':>11}{'HEAD':>11}",
+        "-" * 120,
     ]
-
     for r in results:
         lines.append(
-            f"{r['family']:<13}"
-            f"{r['condition']:<38}"
+            f"{r['condition']:<30}"
             f"{r['trainable_params']/1e9:>12.3f}"
             f"{r['best_epoch']:>9d}"
             f"{r['val_ade_m']:>11.4f}"
             f"{r['val_fde_m']:>11.4f}"
             f"{r['val_heading_mae_rad']:>11.4f}"
         )
-
     (args.model_root / "summary.txt").write_text(
         "\n".join(lines) + "\n",
         encoding="utf-8",
@@ -2197,7 +2272,9 @@ def save_summary(args, results):
 # =============================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Train only direct/reasoning RAW-KV Flow-Matching DiT models."
+    )
 
     p.add_argument("--vlm", type=Path, default=VLM_PATH)
     p.add_argument("--train-jsonl", type=Path, default=TRAIN_JSONL)
@@ -2207,14 +2284,7 @@ def parse_args():
 
     p.add_argument("--rebuild-cache", action="store_true")
     p.add_argument("--overwrite-models", action="store_true")
-    p.add_argument(
-        "--validate-only",
-        action="store_true",
-        help=(
-            "Validate the prepared Action Expert fixed-split rows and split "
-            "integrity, then exit before loading the VLM."
-        ),
-    )
+    p.add_argument("--validate-only", action="store_true")
 
     p.add_argument(
         "--vlm-dtype",
@@ -2225,22 +2295,11 @@ def parse_args():
     p.add_argument("--allow-truncated", action="store_true")
 
     p.add_argument(
-        "--families",
-        nargs="+",
-        choices=FAMILIES,
-        default=list(FAMILIES),
-    )
-    p.add_argument(
         "--branches",
         nargs="+",
         choices=BRANCHES,
         default=list(BRANCHES),
-    )
-    p.add_argument(
-        "--transformer-architectures",
-        nargs="+",
-        choices=ARCHITECTURES,
-        default=list(ARCHITECTURES),
+        help="Default trains direct first, then reasoning.",
     )
 
     p.add_argument("--gpu-id", type=int, default=0)
@@ -2255,7 +2314,6 @@ def parse_args():
 
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM)
     p.add_argument("--num-layers", type=int, default=NUM_LAYERS)
-    p.add_argument("--num-heads", type=int, default=NUM_HEADS)
     p.add_argument("--ff-dim", type=int, default=FF_DIM)
     p.add_argument("--dropout", type=float, default=DROPOUT)
     p.add_argument("--no-gradient-checkpointing", action="store_true")
@@ -2266,7 +2324,6 @@ def parse_args():
         choices=("uniform", "beta"),
         default=TIMESTEP_SAMPLER,
     )
-
     return p.parse_args()
 
 
@@ -2292,65 +2349,52 @@ def main():
     if args.max_new_tokens < 1:
         raise ValueError("max-new-tokens must be >= 1")
 
-    # Dataset was already built from raw nuReasoning by the fixed-split
-    # Action Expert prepare script. No new split is created here.
     train_rows = load_split(args.train_jsonl, "train")
     val_rows = load_split(args.val_jsonl, "val")
     validate_fixedsplit_dataset(train_rows, val_rows)
 
     if args.validate_only:
         print("=" * 120)
-        print("FIXEDSPLIT ACTION EXPERT DATA VALIDATION: PASS")
+        print("FIXEDSPLIT RAW-KV DiT DATA VALIDATION: PASS")
         print("=" * 120)
         print("VLM           :", args.vlm)
         print("Dataset root  :", ACTION_DATASET_ROOT)
         print("Split JSON    :", SPLIT_JSON_PATH)
-        print(
-            "Train / Val   :",
-            len(train_rows),
-            "/",
-            len(val_rows),
-            "(all valid AE rows)",
-        )
-        print("Trajectory GT : 10 x (x,y,yaw), prepared from raw Part1")
+        print("Train / Val   :", len(train_rows), "/", len(val_rows))
         print("Training      : NOT STARTED (--validate-only)")
         return
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if not torch.cuda.is_bf16_supported():
-        raise RuntimeError(
-            "BF16 Action Expert training requires RTX 3080 Ti / BF16-capable GPU."
-        )
+        raise RuntimeError("BF16-capable CUDA GPU is required for Action Expert training")
 
     torch.cuda.set_device(args.gpu_id)
     device = torch.device(f"cuda:{args.gpu_id}")
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
     set_seed(args.seed)
 
     print("=" * 120)
-    print("Reasoning_VLM_v2_fixedsplit | ALL 10 ACTION EXPERTS")
+    print("Reasoning_VLM_v2_fixedsplit | RAW-KV FLOW / DiT ONLY")
     print("=" * 120)
     print("GPU           :", torch.cuda.get_device_name(args.gpu_id))
     print("VLM           :", args.vlm)
     print("Dataset root  :", ACTION_DATASET_ROOT)
     print("Split JSON    :", SPLIT_JSON_PATH)
     print("Prompt mode   :", PROMPT_MODE)
-    print("Train / Val   :", len(train_rows), "/", len(val_rows), "(all valid AE rows)")
+    print("Train / Val   :", len(train_rows), "/", len(val_rows))
+    print("Branches      :", ", ".join(args.branches))
     print("Cache root    :", args.cache_root)
     print("Model root    :", args.model_root)
-    print("Families      :", ", ".join(args.families))
-    print("Branches      :", ", ".join(args.branches))
-    print("Architectures :", ", ".join(args.transformer_architectures))
-    print("Ablation axes  : Input=direct/reasoning | Structure=encoder/decoder | Direction=bidirectional/causal")
-    print("Naming axes   : input(direct/reasoning) / structure(encoder/decoder) / direction(bidirectional/causal)")
+    print("RAW-KV mode   : VLM K/V direct prefix; NO K/V concat/projector/re-projection")
     print(
-        "Capacity      :",
-        f"H={args.hidden_dim} L={args.num_layers} "
-        f"heads={args.num_heads} FF={args.ff_dim}",
+        "DiT capacity  :",
+        f"H={args.hidden_dim} L={args.num_layers} FF={args.ff_dim}",
+    )
+    print(
+        "Flow          :",
+        f"sampler={args.timestep_sampler} Euler={args.solver_steps} steps",
     )
     print(
         "Batch         :",
@@ -2358,7 +2402,7 @@ def main():
         f"= {args.batch_size * args.grad_accum}",
     )
 
-    # 1) One unified Reasoning_VLM_v2_fixedsplit cache.
+    # Build/reuse one frozen VLM RAW-KV cache, then unload the VLM.
     train_manifest, val_manifest = build_cache(
         args,
         train_rows,
@@ -2367,139 +2411,84 @@ def main():
         resolve_dtype(args.vlm_dtype),
     )
 
-    input_dim = infer_input_dim(train_manifest)
-    if infer_input_dim(val_manifest) != input_dim:
-        raise RuntimeError("Train/Val KV input_dim mismatch")
+    vlm_num_attention_heads, vlm_num_kv_heads, vlm_head_dim = infer_kv_geometry(
+        train_manifest
+    )
+    val_geometry = infer_kv_geometry(val_manifest)
+    if val_geometry != (
+        vlm_num_attention_heads,
+        vlm_num_kv_heads,
+        vlm_head_dim,
+    ):
+        raise RuntimeError("Train/Val RAW-KV geometry mismatch")
+
+    print(
+        "RAW VLM KV    :",
+        f"Hq/Hkv={vlm_num_attention_heads}/{vlm_num_kv_heads} "
+        f"head_dim={vlm_head_dim}",
+    )
 
     cache_signature = sha256_file(args.cache_root / "meta.json")
 
-    # 2) VLM is already unloaded inside build_cache(). Train exactly one Action
-    #    Expert at a time from here.
+    oracle_error = linear_flow_oracle_sanity_check(
+        seed=args.seed,
+        solver_steps=10,
+    )
+    if oracle_error > 1e-5:
+        raise RuntimeError(f"Flow oracle check failed: {oracle_error:.8e}")
+
+    normalizer = compute_normalizer(train_manifest)
+    print("Oracle check  :", f"PASS max_error={oracle_error:.3e}")
+    print("Normalizer    :", normalizer.mode)
+
     args.model_root.mkdir(parents=True, exist_ok=True)
     results = []
+    all_start = time.perf_counter()
 
-    total_requested_models = (
-        len(args.transformer_architectures) * len(args.branches)
-        if "transformer" in args.families
-        else 0
-    ) + (
-        len(args.branches)
-        if "flow" in args.families
-        else 0
-    )
-
-    all_models_start = time.perf_counter()
-    completed_model_times: List[float] = []
-
-    def print_overall_eta(last_model_name: str, last_model_seconds: float) -> None:
-        completed_model_times.append(float(last_model_seconds))
-        completed = len(completed_model_times)
-        avg_model_sec = sum(completed_model_times) / completed
-        remaining = max(0, total_requested_models - completed)
-        total_eta = avg_model_sec * remaining
-        total_elapsed = time.perf_counter() - all_models_start
-
+    for idx, branch in enumerate(args.branches, 1):
+        model_t0 = time.perf_counter()
+        result = train_flow(
+            branch=branch,
+            train_manifest=train_manifest,
+            val_manifest=val_manifest,
+            vlm_num_attention_heads=vlm_num_attention_heads,
+            vlm_num_kv_heads=vlm_num_kv_heads,
+            vlm_head_dim=vlm_head_dim,
+            cache_signature=cache_signature,
+            normalizer=normalizer,
+            device=device,
+            args=args,
+        )
+        model_sec = time.perf_counter() - model_t0
+        results.append(result)
+        save_summary(args, results)
         print(
-            f"[OVERALL] completed={completed}/{total_requested_models} | "
-            f"last={last_model_name} "
-            f"({format_eta(last_model_seconds)}) | "
-            f"elapsed={format_eta(total_elapsed)} | "
-            f"eta~={format_eta(total_eta)}",
+            f"[OVERALL] completed={idx}/{len(args.branches)} | "
+            f"last={result['condition']} ({format_eta(model_sec)}) | "
+            f"elapsed={format_eta(time.perf_counter() - all_start)}",
             flush=True,
         )
 
-    # Training order: Flow/DiT v2 first, then Transformer ablations.
-    if "flow" in args.families:
-        oracle_error = linear_flow_oracle_sanity_check(
-            seed=args.seed,
-            solver_steps=10,
-        )
-        if oracle_error > 1e-5:
-            raise RuntimeError(
-                f"Flow oracle check failed: {oracle_error:.8e}"
-            )
-
-        normalizer = compute_normalizer(train_manifest)
-
-        print("\n" + "=" * 120)
-        print("FLOW / DiT v2 STARTUP")
-        print("=" * 120)
-        print("Oracle check :", f"PASS max_error={oracle_error:.3e}")
-        print("Normalizer   :", normalizer.mode)
-
-        # Branch order follows --branches (default: direct -> reasoning).
-        for branch in args.branches:
-            _model_t0 = time.perf_counter()
-            r = train_flow(
-                branch=branch,
-                train_manifest=train_manifest,
-                val_manifest=val_manifest,
-                input_dim=input_dim,
-                cache_signature=cache_signature,
-                normalizer=normalizer,
-                device=device,
-                args=args,
-            )
-            _model_sec = time.perf_counter() - _model_t0
-            results.append(r)
-            save_summary(args, results)
-            print_overall_eta(r["condition"], _model_sec)
-
-    if "transformer" in args.families:
-        # Naming order: input / structure / attention direction.
-        # direct_* four models first, then reasoning_* four models.
-        for branch in args.branches:
-            for architecture in args.transformer_architectures:
-                _model_t0 = time.perf_counter()
-                r = train_direct(
-                    architecture=architecture,
-                    branch=branch,
-                    train_manifest=train_manifest,
-                    val_manifest=val_manifest,
-                    input_dim=input_dim,
-                    cache_signature=cache_signature,
-                    device=device,
-                    args=args,
-                )
-                _model_sec = time.perf_counter() - _model_t0
-                results.append(r)
-                save_summary(args, results)
-                print_overall_eta(r["condition"], _model_sec)
-
     save_summary(args, results)
 
-    expected = (
-        len(args.transformer_architectures) * len(args.branches)
-        if "transformer" in args.families
-        else 0
-    ) + (
-        len(args.branches)
-        if "flow" in args.families
-        else 0
-    )
-
     print("\n" + "=" * 120)
-    print("TRAINING COMPLETE")
+    print("RAW-KV DiT TRAINING COMPLETE")
     print("=" * 120)
     print(
-        f"{'FAMILY':<13}{'CONDITION':<38}{'PARAMS(B)':>12}"
-        f"{'BEST_E':>9}{'ADE':>11}{'FDE':>11}{'HEAD':>11}"
+        f"{'CONDITION':<30}{'PARAMS(B)':>12}{'BEST_E':>9}"
+        f"{'ADE':>11}{'FDE':>11}{'HEAD':>11}"
     )
     print("-" * 120)
-
     for r in results:
         print(
-            f"{r['family']:<13}"
-            f"{r['condition']:<38}"
+            f"{r['condition']:<30}"
             f"{r['trainable_params']/1e9:>12.3f}"
             f"{r['best_epoch']:>9d}"
             f"{r['val_ade_m']:>11.4f}"
             f"{r['val_fde_m']:>11.4f}"
             f"{r['val_heading_mae_rad']:>11.4f}"
         )
-
     print()
-    print("Requested models :", expected)
     print("Completed models :", len(results))
     print("Summary          :", args.model_root / "summary.txt")
     print("Model root       :", args.model_root)

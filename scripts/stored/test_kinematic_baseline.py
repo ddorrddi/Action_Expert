@@ -206,7 +206,7 @@ def import_reasoning_core(vlm_script_dir: Path):
     if str(vlm_script_dir) not in sys.path:
         sys.path.insert(0, str(vlm_script_dir))
 
-    import reasoning_v2_core as core  # type: ignore
+    import scripts.stored.reasoning_v2_core as core  # type: ignore
 
     return core
 

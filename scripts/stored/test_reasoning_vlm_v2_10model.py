@@ -113,19 +113,19 @@ from scripts.stored.action_model_ablation_v2 import (
 )
 
 try:
-    from scripts.stored.action_model_flow_dit import (
+    from scripts.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,
     )
 except ImportError:
-    from scripts.stored.action_model_flow_dit import (
+    from scripts.action_model_flow_dit import (
         TrajectoryNormalizer,
         build_flow_dit,
         euler_sample,
     )
 
-import reasoning_v2_core as vlm_v2_core
+import scripts.stored.reasoning_v2_core as vlm_v2_core
 
 
 # =============================================================================

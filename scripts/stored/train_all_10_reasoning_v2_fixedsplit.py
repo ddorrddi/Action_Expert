@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train all 10 Action Expert models with frozen Reasoning_VLM_v2 features.
+Train all 10 Action Expert models using the NEW fixed-split dataset and
+the NEW Reasoning_VLM_v2_fixedsplit model.
+
+Prepared Action Expert dataset
+------------------------------
+Create first with prepare_action_expert_fixedsplit.py:
+
+    /home/lhh/lab/Dataset/ActionExpert/part1_fixedsplit/
+        train.jsonl
+        val.jsonl
+        test.jsonl
+        manifest.json
+
+The prepare stage preserves the original Action Expert sample policy:
+- every valid Part1 frame
+- no task/sample cap
+- 10 x (x,y,yaw), 0.5 s interval, 5 s, current-ego frame
+- valid reasoning trace required
+
+Only the split policy changes:
+- exact clip membership from ~/splits_vlm.json
+- driving-log-disjoint train/val/test
+- no old ActionExpert8 80/10/10 split
+- no new random split inside this trainer
 
 10 models
 ---------
@@ -15,38 +38,25 @@ Transformer 2 x 2 x 2 ablation (8):
   reasoning_decoder_bidirectional
   reasoning_decoder_causal
 
-Naming axes
------------
-1) Input/cache stage
-   - direct    : prompt-boundary last-layer KV only
-   - reasoning : prompt-boundary KV + generated-reasoning KV delta
-
-2) Structure
-   - encoder : encoder-style fusion: memory + trajectory queries in one self-attention stack
-   - decoder : decoder-style fusion: trajectory queries cross-attend to VLM memory
-
-3) Attention direction
-   - bidirectional : trajectory queries can attend to all trajectory queries
-   - causal        : trajectory query t cannot attend to future trajectory queries
-
 Flow/DiT v2 (2):
   direct_flow_dit
   reasoning_flow_dit
 
 Important
 ---------
-- SAME frozen VLM for every branch:
-    /home/lhh/lab/models/vlm/Reasoning_VLM_v2
-- Reasoning_VLM_v2 prompt is matched to its training format:
+- Frozen VLM for every branch:
+    /home/lhh/lab/models/vlm/Reasoning_VLM_v2_fixedsplit
+- VLM prompt:
     3 cameras + mission command + speed + acceleration + heading/yaw
     + reasoning-only instruction.
-- Existing ActionExpert8 Part1 train/val split and 10 x (x,y,yaw) GT are kept.
-- If old prepared rows do not contain acceleration/heading, they are restored
-  from the original nuReasoning Part1 ego_state using reasoning_v2_core helpers.
-- Action Expert architecture/capacity/loss/optimizer/training schedule are kept.
+- direct:
+    prompt-boundary last-layer KV.
+- reasoning:
+    same prompt-boundary KV + target-model greedy AR reasoning KV delta.
+- DFlash is NOT used to create Action Expert training features.
 - One VLM KV cache is generated once; then the VLM is unloaded.
 - The 10 Action Experts are trained sequentially, one model at a time.
-- Training order: Flow/DiT v2 (direct -> reasoning) first, then Transformer ablations.
+- Training order: Flow/DiT v2 first, then Transformer ablations.
 """
 
 from __future__ import annotations
@@ -56,7 +66,6 @@ import gc
 import hashlib
 import json
 import math
-import pickle
 import random
 import shutil
 import sys
@@ -81,29 +90,43 @@ from transformers import (
 # =============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ACTION_SCRIPT_DIR = Path("/home/lhh/lab/Action_Expert/scripts")
+ACTION_PROJECT_ROOT = Path("/home/lhh/lab/Action_Expert")
+ACTION_SCRIPT_DIR = ACTION_PROJECT_ROOT / "scripts"
 VLM_SCRIPT_DIR = Path("/home/lhh/lab/VLM/scripts")
-RAW_PART1_ROOT = Path("/media/HDD/nuReasoning/train/part_1")
-
-for _p in (SCRIPT_DIR, ACTION_SCRIPT_DIR, VLM_SCRIPT_DIR):
+for _p in (SCRIPT_DIR, ACTION_PROJECT_ROOT, ACTION_SCRIPT_DIR, VLM_SCRIPT_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-VLM_PATH = Path("/home/lhh/lab/models/vlm/Reasoning_VLM_v2")
-
-PART1_SPLIT_ROOT = Path(
-    "/home/lhh/lab/Action_Expert/dataset/ActionExpert8/part1"
+# Newly merged fixed-split VLM.
+VLM_PATH = Path(
+    "/home/lhh/lab/models/vlm/Reasoning_VLM_v2_fixedsplit"
 )
-TRAIN_JSONL = PART1_SPLIT_ROOT / "train.jsonl"
-VAL_JSONL = PART1_SPLIT_ROOT / "val.jsonl"
 
-CACHE_ROOT = Path(
-    "/home/lhh/lab/Action_Expert/dataset/ActionExpert10_v2/action_kv_cache"
+# Central dataset root + Action Expert fixed-split dataset.
+DATASET_ROOT = Path("/home/lhh/lab/Dataset")
+ACTION_DATASET_ROOT = (
+    DATASET_ROOT / "ActionExpert" / "part1_fixedsplit"
+)
+TRAIN_JSONL = ACTION_DATASET_ROOT / "train.jsonl"
+VAL_JSONL = ACTION_DATASET_ROOT / "val.jsonl"
+TEST_JSONL = ACTION_DATASET_ROOT / "test.jsonl"
+ACTION_DATASET_MANIFEST_PATH = ACTION_DATASET_ROOT / "manifest.json"
+CENTRAL_DATASET_MANIFEST_PATH = DATASET_ROOT / "manifest.json"
+
+# Authoritative senior/base split used by the fixed-split VLM.
+SPLIT_JSON_PATH = Path("/home/lhh/splits_vlm.json")
+
+# New cache/model roots: never mix with old ActionExpert8 / old Reasoning_VLM_v2.
+CACHE_ROOT = (
+    DATASET_ROOT
+    / "ActionExpert"
+    / "reasoning_vlm_v2_fixedsplit_10model"
+    / "action_kv_cache"
 )
 MODEL_ROOT = Path(
-    "/home/lhh/lab/models/action_expert/reasoning_vlm_v2_10model"
+    "/home/lhh/lab/models/action_expert/"
+    "reasoning_vlm_v2_fixedsplit_10model"
 )
-
 
 
 # =============================================================================
@@ -185,9 +208,9 @@ HEADING_LOSS_WEIGHT = 0.5
 GRAD_CLIP_NORM = 1.0
 NORMALIZER_STD_FLOOR = 1.0e-3
 
-CACHE_VERSION = "reasoning_vlm_v2_target_ar_kv_ablation_v2"
+CACHE_VERSION = "reasoning_vlm_v2_fixedsplit_target_ar_kv_ablation_v3"
 
-PROMPT_MODE = "reasoning_v2_ego_state_reasoning_only"
+PROMPT_MODE = "reasoning_v2_fixedsplit_ego_state_reasoning_only"
 ATTN_IMPLEMENTATION = "sdpa"
 MIN_PIXELS = 200_704
 MAX_PIXELS = 200_704
@@ -252,6 +275,41 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def model_dir_signature(path: Path) -> str:
+    """
+    Lightweight signature for cache invalidation when a model directory is
+    overwritten in place. Hash filenames + sizes + mtimes of model/config files.
+    """
+    path = Path(path).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+
+    patterns = (
+        "*.safetensors",
+        "*.bin",
+        "*.json",
+        "*.model",
+        "*.txt",
+    )
+    files = []
+    for pattern in patterns:
+        files.extend(path.glob(pattern))
+
+    files = sorted({f.resolve() for f in files if f.is_file()})
+    if not files:
+        raise RuntimeError(f"No model/config files found under {path}")
+
+    h = hashlib.sha256()
+    for file_path in files:
+        stat = file_path.stat()
+        rel = file_path.relative_to(path)
+        h.update(str(rel).encode("utf-8"))
+        h.update(str(stat.st_size).encode("ascii"))
+        h.update(str(stat.st_mtime_ns).encode("ascii"))
+
+    return h.hexdigest()
+
+
 def cache_filename(index: int, sample_id: str) -> str:
     digest = hashlib.sha1(sample_id.encode("utf-8")).hexdigest()[:12]
     return f"{index:05d}_{digest}.pt"
@@ -266,144 +324,24 @@ def resolve_dtype(name: str) -> torch.dtype:
 
 
 # =============================================================================
-# SOURCE ROWS + Reasoning_VLM_v2 EGO CONTEXT RESTORATION
+# ACTION EXPERT FIXED-SPLIT ROWS
 # =============================================================================
 
-
-# ---------------------------------------------------------------------------
-# nuReasoning pickle compatibility
-# ---------------------------------------------------------------------------
-# Some ego_state.pkl files were serialized with classes whose module path is
-# "data_schema" or "data_schema_v0". The original module is not required here:
-# Action Expert only needs the stored object attributes. Intercept those legacy
-# class lookups during unpickling and map them to permissive placeholder classes.
-
-_LEGACY_PICKLE_CLASS_CACHE: Dict[Tuple[str, str], type] = {}
-
-
-def _legacy_pickle_class(module: str, name: str) -> type:
-    key = (str(module), str(name))
-
-    if key not in _LEGACY_PICKLE_CLASS_CACHE:
-        cls = type(str(name), (), {})
-        cls.__module__ = str(module)
-        _LEGACY_PICKLE_CLASS_CACHE[key] = cls
-
-    return _LEGACY_PICKLE_CLASS_CACHE[key]
-
-
-class NuReasoningCompatUnpickler(pickle.Unpickler):
-    def find_class(self, module: str, name: str):
-        if module in {"data_schema", "data_schema_v0"}:
-            return _legacy_pickle_class(module, name)
-
-        return super().find_class(module, name)
-
-
-def load_nureasoning_pickle(path: Path) -> Any:
-    with Path(path).open("rb") as f:
-        return NuReasoningCompatUnpickler(f).load()
-
-
-_RAW_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def _raw_clip_metadata(clip: str) -> Dict[str, Any]:
-    clip = str(clip).strip()
-    if not clip:
-        raise ValueError("Missing clip name")
-
-    if clip not in _RAW_METADATA_CACHE:
-        path = RAW_PART1_ROOT / clip / "metadata.json"
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        _RAW_METADATA_CACHE[clip] = json.loads(path.read_text(encoding="utf-8"))
-
-    return _RAW_METADATA_CACHE[clip]
-
-
-def _resolve_raw_ego_path(row: Dict[str, Any]) -> Path:
-    """Find the original frame and return its ego_state.pkl path."""
-    clip = str(row.get("clip", "")).strip()
-    sid = str(row.get("id", "")).strip()
-    frame_index = int(row.get("frame_index", -1))
-
-    metadata = _raw_clip_metadata(clip)
-    frames = metadata.get("frames", [])
-    if not isinstance(frames, list):
-        raise RuntimeError(f"metadata.frames is not a list: clip={clip}")
-
-    chosen = None
-
-    # Old ActionExpert8 row id is normally the original frame token.
-    for frame in frames:
-        if not isinstance(frame, dict):
-            continue
-        token = str(frame.get("token", "")).strip()
-        if token and token == sid:
-            chosen = frame
-            break
-
-    if chosen is None:
-        for frame in frames:
-            if not isinstance(frame, dict):
-                continue
-            try:
-                idx = int(frame.get("frame_index", -999999))
-            except Exception:
-                continue
-            if idx == frame_index:
-                chosen = frame
-                break
-
-    if chosen is None:
-        raise RuntimeError(
-            f"Could not match raw frame: id={sid}, clip={clip}, frame_index={frame_index}"
-        )
-
-    ego_value = chosen.get("ego_state")
-    if not ego_value:
-        raise KeyError(f"Missing ego_state in raw metadata: id={sid}")
-
-    ego_path = Path(str(ego_value)).expanduser()
-    if not ego_path.is_absolute():
-        ego_path = (RAW_PART1_ROOT / clip / ego_path).resolve()
-
-    if not ego_path.is_file():
-        raise FileNotFoundError(ego_path)
-
-    return ego_path
-
-
-def restore_v2_ego_context(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Restore the exact ego-state fields used by Reasoning_VLM_v2 training.
-
-    This leaves the existing ActionExpert8 split and [10,3] trajectory target
-    untouched. Only VLM prompt-side context is enriched.
-    """
-    row = dict(row)
-    ego_path = _resolve_raw_ego_path(row)
-    ego_state = load_nureasoning_pickle(ego_path)
-
-    _, _, heading = vlm_v2_core.extract_pose(ego_state)
-    speed = vlm_v2_core.extract_speed_mps(ego_state)
-    acceleration = vlm_v2_core.extract_acceleration_mps2(ego_state, heading)
-
-    if speed is None or not math.isfinite(float(speed)):
-        raise RuntimeError(f"Missing/non-finite speed: id={row.get('id')}")
-    if acceleration is None or not math.isfinite(float(acceleration)):
-        raise RuntimeError(f"Missing/non-finite acceleration: id={row.get('id')}")
-    if not math.isfinite(float(heading)):
-        raise RuntimeError(f"Missing/non-finite heading: id={row.get('id')}")
-
-    row["speed_mps"] = float(speed)
-    row["acceleration_mps2"] = float(acceleration)
-    row["heading_rad"] = float(heading)
-    return row
+def _finite_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if math.isfinite(out) else None
 
 
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate one row produced by prepare_action_expert_fixedsplit.py.
+
+    Expected GT:
+        row["trajectory"] -> [10,3] = x, y, yaw
+    """
     row = dict(row)
 
     sid = str(row.get("id", "")).strip()
@@ -411,72 +349,229 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Empty sample id")
     row["id"] = sid
 
+    clip = str(row.get("clip", "")).strip()
+    if not clip:
+        raise ValueError(f"Missing clip id={sid}")
+    row["clip"] = clip
+
     command = str(
-        row.get("mission_command")
-        or row.get("command")
+        row.get("command")
+        or row.get("mission_command")
         or ""
     ).strip()
     if not command:
         raise ValueError(f"Missing mission command id={sid}")
-    row["mission_command"] = command
     row["command"] = command
+    row["mission_command"] = command
 
     images = row.get("images")
-    if isinstance(images, dict):
-        required = ("front_left", "front", "front_right")
-        missing = [k for k in required if not images.get(k)]
-        if missing:
-            raise ValueError(f"Missing images id={sid}: {missing}")
-        paths = [str(images[k]) for k in required]
-    elif isinstance(images, list) and len(images) == 3:
-        paths = [str(x) for x in images]
-    else:
-        raise ValueError(f"Expected exactly 3 images id={sid}: {images}")
+    if not isinstance(images, list) or len(images) != 3:
+        raise ValueError(
+            f"Expected exactly 3 image paths id={sid}: {images}"
+        )
 
-    for p in paths:
-        if not Path(p).is_file():
-            raise FileNotFoundError(f"id={sid}: {p}")
+    paths = [str(x) for x in images]
+    for image_path in paths:
+        if not Path(image_path).is_file():
+            raise FileNotFoundError(f"id={sid}: {image_path}")
     row["images"] = paths
 
-    # Keep the original Action Expert target exactly as before: 10 x (x,y,yaw).
-    gt = np.asarray(row.get("trajectory"), dtype=np.float32)
-    if gt.shape != (NUM_STEPS, 3):
-        raise ValueError(f"trajectory must be [10,3] id={sid}, got={gt.shape}")
-    if not np.isfinite(gt).all():
-        raise ValueError(f"Non-finite trajectory id={sid}")
+    for key in ("speed_mps", "acceleration_mps2", "heading_rad"):
+        value = _finite_float(row.get(key))
+        if value is None:
+            raise RuntimeError(f"Missing/non-finite {key}: id={sid}")
+        row[key] = value
 
-    # Reasoning_VLM_v2 was trained with speed + acceleration + heading/yaw.
-    row = restore_v2_ego_context(row)
+    trajectory = np.asarray(
+        row.get("trajectory"),
+        dtype=np.float32,
+    )
+    if trajectory.shape != (NUM_STEPS, 3):
+        raise ValueError(
+            f"trajectory must be [10,3] id={sid}, got={trajectory.shape}"
+        )
+    if not np.isfinite(trajectory).all():
+        raise ValueError(f"Non-finite trajectory id={sid}")
+    row["trajectory"] = trajectory.tolist()
+
     return row
 
 
-def load_split(path: Path) -> List[Dict[str, Any]]:
-    rows = [normalize_row(x) for x in read_jsonl(path)]
-    ids = [x["id"] for x in rows]
+def load_split(
+    path: Path,
+    split_name: str,
+) -> List[Dict[str, Any]]:
+    rows = [normalize_row(row) for row in read_jsonl(path)]
+
+    if not rows:
+        raise RuntimeError(f"Empty Action Expert split: {path}")
+
+    ids = [row["id"] for row in rows]
     if len(ids) != len(set(ids)):
         raise RuntimeError(f"Duplicate IDs in {path}")
+
+    print(
+        f"[DATA {split_name.upper()}] "
+        f"rows={len(rows)}"
+    )
     return rows
 
 
-def validate_no_leakage(
+def validate_fixedsplit_dataset(
     train_rows: Sequence[Dict[str, Any]],
     val_rows: Sequence[Dict[str, Any]],
 ) -> None:
-    train_ids = {x["id"] for x in train_rows}
-    val_ids = {x["id"] for x in val_rows}
-    overlap = train_ids & val_ids
-    if overlap:
-        raise RuntimeError(f"Train/Val ID leakage: {sorted(overlap)[:5]}")
+    """
+    Hard-verify that the prepared Action Expert dataset uses the same
+    ~/splits_vlm.json as Reasoning_VLM_v2_fixedsplit.
+    """
+    if not ACTION_DATASET_MANIFEST_PATH.is_file():
+        raise FileNotFoundError(
+            f"Action Expert fixedsplit manifest missing: "
+            f"{ACTION_DATASET_MANIFEST_PATH}\n"
+            "Run prepare_action_expert_fixedsplit.py first."
+        )
+    if not SPLIT_JSON_PATH.is_file():
+        raise FileNotFoundError(SPLIT_JSON_PATH)
 
-    train_clips = {str(x.get("clip", "")) for x in train_rows if x.get("clip")}
-    val_clips = {str(x.get("clip", "")) for x in val_rows if x.get("clip")}
-    clip_overlap = train_clips & val_clips
-    if clip_overlap:
-        raise RuntimeError(f"Train/Val clip leakage: {sorted(clip_overlap)[:5]}")
+    manifest = json.loads(
+        ACTION_DATASET_MANIFEST_PATH.read_text(encoding="utf-8")
+    )
+    split_obj = json.loads(
+        SPLIT_JSON_PATH.read_text(encoding="utf-8")
+    )
+
+    policy = manifest.get("split_policy") or {}
+    if policy.get("type") != "fixed_external_driving_log_split":
+        raise RuntimeError(
+            "Action Expert dataset is not marked as fixed driving-log split: "
+            f"{ACTION_DATASET_MANIFEST_PATH}"
+        )
+
+    current_split_sha = sha256_file(SPLIT_JSON_PATH)
+    prepared_split_sha = str(policy.get("source_sha256", "")).strip()
+
+    if prepared_split_sha != current_split_sha:
+        raise RuntimeError(
+            "Action Expert dataset was prepared with a different "
+            "splits_vlm.json.\n"
+            f"prepared={prepared_split_sha}\n"
+            f"current ={current_split_sha}"
+        )
+
+    sampling_policy = manifest.get("sampling_policy") or {}
+    if sampling_policy.get("task_cap") is not None:
+        raise RuntimeError(
+            "Prepared Action Expert dataset unexpectedly has a task cap."
+        )
+    if not bool(sampling_policy.get("use_all_valid_frames", False)):
+        print(
+            "[WARN] Action Expert dataset was prepared with max_per_clip > 0. "
+            "Use the default prepare command for the real experiment."
+        )
+
+    splits = split_obj.get("splits")
+    clip_to_log = split_obj.get("clip_to_log")
+    if not isinstance(splits, dict) or not isinstance(clip_to_log, dict):
+        raise RuntimeError("Invalid splits_vlm.json schema")
+
+    split_sets = {
+        name: {
+            str(x).strip()
+            for x in (splits.get(name) or [])
+            if str(x).strip()
+        }
+        for name in ("train", "val", "test")
+    }
+
+    if split_sets["train"] & split_sets["val"]:
+        raise RuntimeError("train/val clip overlap in splits_vlm.json")
+    if split_sets["train"] & split_sets["test"]:
+        raise RuntimeError("train/test clip overlap in splits_vlm.json")
+    if split_sets["val"] & split_sets["test"]:
+        raise RuntimeError("val/test clip overlap in splits_vlm.json")
+
+    missing_log = [
+        clip
+        for clip in set().union(*split_sets.values())
+        if clip not in clip_to_log or not str(clip_to_log[clip]).strip()
+    ]
+    if missing_log:
+        raise RuntimeError(
+            f"Missing clip_to_log mappings: {sorted(missing_log)[:5]}"
+        )
+
+    split_logs = {
+        name: {
+            str(clip_to_log[clip]).strip()
+            for clip in split_sets[name]
+        }
+        for name in ("train", "val", "test")
+    }
+
+    if split_logs["train"] & split_logs["val"]:
+        raise RuntimeError("train/val driving-log overlap")
+    if split_logs["train"] & split_logs["test"]:
+        raise RuntimeError("train/test driving-log overlap")
+    if split_logs["val"] & split_logs["test"]:
+        raise RuntimeError("val/test driving-log overlap")
+
+    actual_train_clips = {
+        str(row["clip"]).strip() for row in train_rows
+    }
+    actual_val_clips = {
+        str(row["clip"]).strip() for row in val_rows
+    }
+
+    invalid_train = actual_train_clips - split_sets["train"]
+    invalid_val = actual_val_clips - split_sets["val"]
+
+    if invalid_train:
+        raise RuntimeError(
+            "Train rows contain wrong-split clips: "
+            f"{sorted(invalid_train)[:5]}"
+        )
+    if invalid_val:
+        raise RuntimeError(
+            "Val rows contain wrong-split clips: "
+            f"{sorted(invalid_val)[:5]}"
+        )
+    if actual_train_clips & actual_val_clips:
+        raise RuntimeError("Train/Val clip leakage")
+
+    train_ids = {row["id"] for row in train_rows}
+    val_ids = {row["id"] for row in val_rows}
+    if train_ids & val_ids:
+        raise RuntimeError("Train/Val ID leakage")
+
+    # Optional second guard: central fixed-split VLM manifest should reference
+    # the same splits_vlm.json, but the Action Expert rows do not depend on its
+    # capped trajectory rows.
+    if CENTRAL_DATASET_MANIFEST_PATH.is_file():
+        central = json.loads(
+            CENTRAL_DATASET_MANIFEST_PATH.read_text(encoding="utf-8")
+        )
+        central_policy = central.get("split_policy") or {}
+        central_sha = str(
+            central_policy.get("source_sha256", "")
+        ).strip()
+        if central_sha and central_sha != current_split_sha:
+            raise RuntimeError(
+                "Central VLM Dataset manifest and Action Expert split differ."
+            )
+
+    print(
+        "[FIXEDSPLIT] PASS | "
+        f"split_sha256={current_split_sha[:12]}... | "
+        f"train_rows={len(train_rows)} | "
+        f"val_rows={len(val_rows)} | "
+        f"train_clips={len(actual_train_clips)} | "
+        f"val_clips={len(actual_val_clips)}"
+    )
 
 
 # =============================================================================
-# Reasoning_VLM_v2 TARGET-ONLY PREFILL / AR GENERATION
+# Reasoning_VLM_v2_fixedsplit TARGET-ONLY PREFILL / AR GENERATION
 # =============================================================================
 
 CAMERAS = ("front_left", "front", "front_right")
@@ -487,7 +582,7 @@ def load_target_model(
     device: torch.device,
     dtype: torch.dtype,
 ):
-    # Load ONLY the frozen Reasoning_VLM_v2 target model.
+    # Load ONLY the frozen Reasoning_VLM_v2_fixedsplit target model.
     # No DFlash model/checkpoint/helper is used.
     if not path.is_dir():
         raise FileNotFoundError(path)
@@ -560,7 +655,7 @@ def reset_multimodal_rope_state(model) -> None:
 
 
 def make_reasoning_v2_record(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Adapt ActionExpert8 row to reasoning_v2_core.build_prompt()."""
+    """Adapt one central fixed-split trajectory row to the VLM reasoning prompt."""
     return {
         "id": str(row["id"]),
         "task": "reasoning",
@@ -579,7 +674,7 @@ def build_prompt_v2(
     dtype: torch.dtype,
 ) -> Dict[str, Any]:
     """
-    Build the SAME user prompt/image layout used to train Reasoning_VLM_v2.
+    Build the SAME user prompt/image layout used to train Reasoning_VLM_v2_fixedsplit.
 
     Camera labels and image placeholders are intentionally identical to
     reasoning_v2_core.QwenVLCollator.
@@ -977,10 +1072,24 @@ def cache_request(args) -> Dict[str, Any]:
         "vlm_config_sha256": (
             sha256_file(config_path) if config_path.is_file() else None
         ),
+        "vlm_dir_signature": model_dir_signature(args.vlm),
         "train_jsonl": str(args.train_jsonl.resolve()),
         "train_sha256": sha256_file(args.train_jsonl),
         "val_jsonl": str(args.val_jsonl.resolve()),
         "val_sha256": sha256_file(args.val_jsonl),
+        "action_dataset_manifest": str(
+            ACTION_DATASET_MANIFEST_PATH.resolve()
+        ),
+        "action_dataset_manifest_sha256": sha256_file(
+            ACTION_DATASET_MANIFEST_PATH
+        ),
+        "central_dataset_manifest_sha256": (
+            sha256_file(CENTRAL_DATASET_MANIFEST_PATH)
+            if CENTRAL_DATASET_MANIFEST_PATH.is_file()
+            else None
+        ),
+        "split_json": str(SPLIT_JSON_PATH.resolve()),
+        "split_json_sha256": sha256_file(SPLIT_JSON_PATH),
         "vlm_dtype": args.vlm_dtype,
         "max_new_tokens": args.max_new_tokens,
         "allow_truncated": args.allow_truncated,
@@ -1050,7 +1159,7 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
     args.cache_root.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 120)
-    print("STAGE 1 | Reasoning_VLM_v2 TARGET-ONLY KV CACHE")
+    print("STAGE 1 | Reasoning_VLM_v2_fixedsplit TARGET-ONLY KV CACHE")
     print("=" * 120)
     print("VLM         :", args.vlm)
     print("Prompt      :", PROMPT_MODE)
@@ -1137,7 +1246,7 @@ def build_cache(args, train_rows, val_rows, device, vlm_dtype):
 
     meta = {
         "request": cache_request(args),
-        "runtime": "Reasoning_VLM_v2 target-only AR",
+        "runtime": "Reasoning_VLM_v2_fixedsplit target-only AR",
         "decode_backend": "target_autoregressive",
         "dflash_used": False,
         "prompt_mode": PROMPT_MODE,
@@ -1396,7 +1505,7 @@ def train_direct(
         history_path.unlink()
 
     config = {
-        "experiment": "reasoning_vlm_v2_10model",
+        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
         "family": "transformer",
         "condition": name,
         "branch": branch,
@@ -1543,7 +1652,7 @@ def train_direct(
             no_improve = 0
 
             torch.save({
-                "experiment": "reasoning_vlm_v2_10model",
+                "experiment": "reasoning_vlm_v2_fixedsplit_10model",
                 "family": "transformer",
                 "condition": name,
                 "branch": branch,
@@ -1779,7 +1888,7 @@ def train_flow(
         history_path.unlink()
 
     config = {
-        "experiment": "reasoning_vlm_v2_10model",
+        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
         "family": "flow_dit_v2",
         "branch": branch,
         "vlm": str(args.vlm),
@@ -1952,7 +2061,7 @@ def train_flow(
             no_improve = 0
 
             torch.save({
-                "experiment": "reasoning_vlm_v2_10model",
+                "experiment": "reasoning_vlm_v2_fixedsplit_10model",
                 "family": "flow_dit_v2",
                 "version": 2,
                 "branch": branch,
@@ -2039,9 +2148,11 @@ def save_summary(args, results):
     args.model_root.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "experiment": "reasoning_vlm_v2_10model",
+        "experiment": "reasoning_vlm_v2_fixedsplit_10model",
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "vlm": str(args.vlm),
+        "dataset_root": str(DATASET_ROOT),
+        "split_json": str(SPLIT_JSON_PATH),
         "prompt_mode": PROMPT_MODE,
         "cache_root": str(args.cache_root),
         "results": results,
@@ -2054,7 +2165,7 @@ def save_summary(args, results):
 
     lines = [
         "=" * 130,
-        "Reasoning_VLM_v2 | ACTION EXPERT 2x2x2 ABLATION SUMMARY",
+        "Reasoning_VLM_v2_fixedsplit | ACTION EXPERT 2x2x2 ABLATION SUMMARY",
         "=" * 130,
         f"VLM   : {args.vlm}",
         f"Cache : {args.cache_root}",
@@ -2096,6 +2207,14 @@ def parse_args():
 
     p.add_argument("--rebuild-cache", action="store_true")
     p.add_argument("--overwrite-models", action="store_true")
+    p.add_argument(
+        "--validate-only",
+        action="store_true",
+        help=(
+            "Validate the prepared Action Expert fixed-split rows and split "
+            "integrity, then exit before loading the VLM."
+        ),
+    )
 
     p.add_argument(
         "--vlm-dtype",
@@ -2154,14 +2273,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError(
-            "BF16 Action Expert training requires RTX 3080 Ti / BF16-capable GPU."
-        )
-
-    for p in (args.vlm, args.train_jsonl, args.val_jsonl):
+    for p in (
+        args.vlm,
+        args.train_jsonl,
+        args.val_jsonl,
+        ACTION_DATASET_MANIFEST_PATH,
+        SPLIT_JSON_PATH,
+    ):
         if not p.exists():
             raise FileNotFoundError(p)
 
@@ -2174,6 +2292,37 @@ def main():
     if args.max_new_tokens < 1:
         raise ValueError("max-new-tokens must be >= 1")
 
+    # Dataset was already built from raw nuReasoning by the fixed-split
+    # Action Expert prepare script. No new split is created here.
+    train_rows = load_split(args.train_jsonl, "train")
+    val_rows = load_split(args.val_jsonl, "val")
+    validate_fixedsplit_dataset(train_rows, val_rows)
+
+    if args.validate_only:
+        print("=" * 120)
+        print("FIXEDSPLIT ACTION EXPERT DATA VALIDATION: PASS")
+        print("=" * 120)
+        print("VLM           :", args.vlm)
+        print("Dataset root  :", ACTION_DATASET_ROOT)
+        print("Split JSON    :", SPLIT_JSON_PATH)
+        print(
+            "Train / Val   :",
+            len(train_rows),
+            "/",
+            len(val_rows),
+            "(all valid AE rows)",
+        )
+        print("Trajectory GT : 10 x (x,y,yaw), prepared from raw Part1")
+        print("Training      : NOT STARTED (--validate-only)")
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "BF16 Action Expert training requires RTX 3080 Ti / BF16-capable GPU."
+        )
+
     torch.cuda.set_device(args.gpu_id)
     device = torch.device(f"cuda:{args.gpu_id}")
 
@@ -2182,24 +2331,22 @@ def main():
 
     set_seed(args.seed)
 
-    train_rows = load_split(args.train_jsonl)
-    val_rows = load_split(args.val_jsonl)
-    validate_no_leakage(train_rows, val_rows)
-
     print("=" * 120)
-    print("Reasoning_VLM_v2 | ALL 10 ACTION EXPERTS")
+    print("Reasoning_VLM_v2_fixedsplit | ALL 10 ACTION EXPERTS")
     print("=" * 120)
     print("GPU           :", torch.cuda.get_device_name(args.gpu_id))
     print("VLM           :", args.vlm)
+    print("Dataset root  :", ACTION_DATASET_ROOT)
+    print("Split JSON    :", SPLIT_JSON_PATH)
     print("Prompt mode   :", PROMPT_MODE)
-    print("Train / Val   :", len(train_rows), "/", len(val_rows))
+    print("Train / Val   :", len(train_rows), "/", len(val_rows), "(all valid AE rows)")
     print("Cache root    :", args.cache_root)
     print("Model root    :", args.model_root)
     print("Families      :", ", ".join(args.families))
     print("Branches      :", ", ".join(args.branches))
     print("Architectures :", ", ".join(args.transformer_architectures))
     print("Ablation axes  : Input=direct/reasoning | Structure=encoder/decoder | Direction=bidirectional/causal")
-    print("Naming axes   : input(direct/reasoning) / family(encoder/decoder) / attention(self/cross)")
+    print("Naming axes   : input(direct/reasoning) / structure(encoder/decoder) / direction(bidirectional/causal)")
     print(
         "Capacity      :",
         f"H={args.hidden_dim} L={args.num_layers} "
@@ -2211,7 +2358,7 @@ def main():
         f"= {args.batch_size * args.grad_accum}",
     )
 
-    # 1) One unified Reasoning_VLM_v2 cache.
+    # 1) One unified Reasoning_VLM_v2_fixedsplit cache.
     train_manifest, val_manifest = build_cache(
         args,
         train_rows,

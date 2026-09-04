@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from scripts.stored.action_model_flow_dit import (
+from scripts.action_model_flow_dit import (
     TrajectoryNormalizer,
     build_flow_dit,
     euler_sample,
