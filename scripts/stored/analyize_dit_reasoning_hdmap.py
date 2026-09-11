@@ -136,7 +136,7 @@ for _p in (SCRIPT_DIR, ACTION_ROOT, ACTION_SCRIPT_DIR):
         sys.path.insert(0, str(_p))
 
 try:
-    import scripts.stored.test_dit_hdmap_trajectory as dit_base
+    import scripts.test_dit_hdmap_trajectory as dit_base
 except Exception as exc:
     raise RuntimeError(
         "Failed to import the verified HD-map DiT helper.\n"
